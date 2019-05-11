@@ -1,11 +1,77 @@
+//! A crate for creating, parsing and manipulating URLs including relative URLs.
+//!
+//! There are a multitude of crates dedicated to URL parsing and serialising so
+//! I strongly recommend you look them over and evaluate the options available.
+//! I created this one partly because I am new to Rust and wanted to develop a
+//! library and partly because when looking at the other crates I could not find
+//! one that supported relative URLs very well including automatically
+//! generating relative urls from two absolute urls.
+//!
+//! The lowest level of URL manipulation provided is the [`UrlBuilder`] which
+//! allows you to build a URL from the precise components you want starting from
+//! nothing. This can mean that you end up with an invalid URL though so the
+//! higher level structs may be useful.
+//!
+//! At the higher level this crate provides the [`Url`] and [`RelativeUrl`]
+//! structs. Both use the [`UrlBuilder`] under the hood bug [`Url`] ensures that
+//! you always have a valid absolute URL and [`RelativeUrl`] ensures that you
+//! always have a valid relative URL.
+//!
+//! Both [`Url`] and [`RelativeUrl`] follow the web specification for
+//! [URL objects](https://developer.mozilla.org/en-US/docs/Web/API/URL) with a
+//! few minor differences where it makes sense.
+//!
+//! The term `spec` is used frequently throughout the docs to mean a string of
+//! characters that is intended to represent. [`UrlBuilder`], [`Url`] and
+//! [`RelativeUrl`] all provide a `spec()` method to serialize their current
+//! URL into a spec.
+//!
+//! # Examples
+//!
+//! ```
+//! # use urlbuilder::UrlError;
+//! use urlbuilder::{Url, RelativeUrl};
+//!
+//! # fn main() -> Result<(), UrlError> {
+//! let mut url: Url = "https://www.google.com/foo/bar".parse()?;
+//! assert_eq!(url.spec(), "https://www.google.com/foo/bar");
+//! assert_eq!(url.protocol(), "https:");
+//! url.set_host("www.example.com")?;
+//! assert_eq!(url.spec(), "https://www.example.com/foo/bar");
+//!
+//! let mut relative: RelativeUrl = "/bar/foo".parse()?;
+//! assert_eq!(relative.spec(), "/bar/foo");
+//!
+//! let joined = url.join(&relative)?;
+//! assert_eq!(joined.spec(), "https://www.example.com/bar/foo");
+//!
+//! relative.set_host("www.google.com");
+//! assert_eq!(relative.spec(), "//www.google.com/bar/foo");
+//!
+//! let joined = url.join(&relative)?;
+//! assert_eq!(joined.spec(), "https://www.google.com/bar/foo");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`Url`]: struct.Url.html
+//! [`RelativeUrl`]: struct.RelativeUrl.html
+//! [`UrlBuilder`]: struct.UrlBuilder.html
+
+#![warn(missing_docs)]
+#![deny(unused_variables)]
+
 use regex::Regex;
+use std::borrow::Borrow;
 use std::convert::{TryFrom, TryInto};
 use std::error;
 use std::fmt;
 use std::str::FromStr;
 use std::string::ToString;
 
+/// These code points are not allowed anywhere in a uri string.
 const C0_CONTROL: &str = "\u{0000}-\u{001F}";
+/// These are the allowable code points in most parts of a uri string.
 const URL_CODE_POINTS: &str =
     "0-9A-Za-z!$&'()*+,-\\./:;=?@_~\u{00A0}-\u{D7FF}\u{E000}-\u{10FFFD}--\
      [\u{FDD0}-\u{FDEF}\u{FFFE}\u{FFFF}\u{1FFFE}\u{1FFFF}\u{2FFFE}\u{2FFFF}\
@@ -14,16 +80,29 @@ const URL_CODE_POINTS: &str =
      \u{BFFFE}\u{BFFFF}\u{CFFFE}\u{CFFFF}\u{DFFFE}\u{DFFFF}\u{EFFFE}\u{EFFFF}\
      \u{FFFFE}\u{FFFFF}\u{10FFFE}\u{10FFFF}]\
      ";
+/// Matches a percent encoded code point.
 const PERCENT_ENCODED_BYTE: &str = "%[0-9a-fA-F]{2}";
 
-fn percent_decode(data: &str) -> String {
+/// Responsible for percent decoding a string.
+///
+/// The result contains all the characters from the original with percent
+/// encoded bytes converted back to their original representation.
+pub fn percent_decode(data: &str) -> String {
     String::from(data)
 }
 
-fn percent_encode(data: &str) -> String {
+/// Responsible for percent encoding a string.
+///
+/// The result contains all the characters from the original with illegal
+/// characters percent encoded.
+pub fn percent_encode(data: &str) -> String {
     String::from(data)
 }
 
+/// Represents an error that occurred while parsing or manipulating a URI.
+///
+/// Currently doesn't provide much that a program can use to figure out what
+/// went wrong.
 #[derive(Debug)]
 pub struct UrlError {
     spec: String,
@@ -31,10 +110,12 @@ pub struct UrlError {
 }
 
 impl UrlError {
+    /// Creates a new `UrlError` from a message and the
+    /// spec currently being parsed.
     fn new(message: &str, spec: &str) -> Self {
         Self {
-            spec: String::from(spec),
-            message: String::from(message),
+            spec: spec.to_owned(),
+            message: message.to_owned(),
         }
     }
 }
@@ -47,9 +128,11 @@ impl fmt::Display for UrlError {
 
 impl error::Error for UrlError {}
 
+/// A specialized result where the error is always a [`UrlError`](struct.UrlError.html).
 pub type UrlResult<T> = Result<T, UrlError>;
 
-pub fn regex(r: &str) -> UrlResult<Regex> {
+/// A simple wrapper around generating a regular expression.
+fn regex(r: &str) -> UrlResult<Regex> {
     match Regex::new(r) {
         Ok(result) => Ok(result),
         Err(err) => Err(match err {
@@ -68,6 +151,7 @@ pub fn regex(r: &str) -> UrlResult<Regex> {
     }
 }
 
+/// The default ports for the non-file special schemes.
 const SPECIAL_SCHEMES: [(&str, u32); 6] = [
     ("ftp", 21),
     ("gopher", 70),
@@ -77,6 +161,7 @@ const SPECIAL_SCHEMES: [(&str, u32); 6] = [
     ("wss", 443),
 ];
 
+/// Lists the different scheme types.
 #[derive(Debug, Clone, PartialEq)]
 enum Scheme {
     Special(String),
@@ -85,6 +170,8 @@ enum Scheme {
 }
 
 impl Scheme {
+    /// Converts a string to a `Scheme`. The string should
+    /// not contain a trailing `:`.
     fn from(scheme: &str) -> Option<Self> {
         if scheme.is_empty() {
             return None;
@@ -104,7 +191,9 @@ impl Scheme {
         }
     }
 
-    fn get_default_port(&self) -> Option<u32> {
+    /// Gets the default port for this scheme. Only Special schemes have a
+    /// default port.
+    fn default_port(&self) -> Option<u32> {
         match self {
             Scheme::Special(s) => {
                 for info in &SPECIAL_SCHEMES {
@@ -141,6 +230,9 @@ impl fmt::Display for Scheme {
     }
 }
 
+/// Holds the username, password, hostname and port of the URL.
+///
+/// There is always a hostname, the other fields are optional.
 #[derive(Debug, Clone, PartialEq, Default)]
 struct Host {
     username: Option<String>,
@@ -150,7 +242,8 @@ struct Host {
 }
 
 impl Host {
-    fn get_hostport(&self) -> String {
+    /// Gets the host and port parts of the host.
+    fn hostport(&self) -> String {
         match self.port {
             Some(p) => format!("{}:{}", percent_encode(&self.hostname), p),
             None => self.hostname.clone(),
@@ -172,10 +265,13 @@ impl fmt::Display for Host {
             f.write_str("@")?;
         }
 
-        f.write_str(&self.get_hostport())
+        f.write_str(&self.hostport())
     }
 }
 
+/// Normalizes set of path segments by removing any `.` segments and making `..`
+/// elements remove the preceeding segment. When the path is absolute any `..`
+/// segments at the start of the path are stripped.
 fn normalize(components: &[String]) -> Vec<String> {
     let mut result: Vec<String> = Default::default();
 
@@ -227,12 +323,17 @@ fn normalize(components: &[String]) -> Vec<String> {
     result
 }
 
+/// Holds a relative or absolute path. Held as a set of path segments such that
+/// joining the segments with a `/` will result in the full path. A preceeding
+/// `""` marks the path as absolute, a trailing `""` marks it as referencing
+/// to something treated like a directory.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct Path {
+struct Path {
     components: Vec<String>,
 }
 
 impl Path {
+    /// Converts a full path to a `Path`.
     pub fn from(path: &str) -> Self {
         if path.is_empty() {
             Default::default()
@@ -243,10 +344,13 @@ impl Path {
         }
     }
 
+    /// Normalizes the path components.
     fn normalize(&mut self) {
         self.components = normalize(&self.components);
     }
 
+    /// Joins one path to another. At a high level this is similar to being in
+    /// this path in a filesystem and running `cd <relative>`.
     pub fn join(&self, relative: &Path) -> UrlResult<Path> {
         if relative.is_empty() {
             return Ok(self.clone());
@@ -267,6 +371,8 @@ impl Path {
         Ok(new_path)
     }
 
+    /// Generates a relative path then when joined with the `base_path` will
+    /// result in this path.
     pub fn relative_to(&self, base_path: &Path) -> UrlResult<Path> {
         if self.is_absolute() != base_path.is_absolute() {
             return Err(UrlError::new(
@@ -323,10 +429,12 @@ impl Path {
         Ok(result)
     }
 
+    /// Returns true if the current path has no segments.
     pub fn is_empty(&self) -> bool {
         self.components.is_empty()
     }
 
+    /// Returns true if this is an absolute path (starts with `/`).
     pub fn is_absolute(&self) -> bool {
         match self.components.first() {
             Some(p) => p.is_empty(),
@@ -334,6 +442,7 @@ impl Path {
         }
     }
 
+    /// Returns true if this is a relative path (does not start with `/`).
     pub fn is_relative(&self) -> bool {
         match self.components.first() {
             Some(p) => !p.is_empty(),
@@ -341,6 +450,7 @@ impl Path {
         }
     }
 
+    /// Returns true if this references a directory (ends with `/`).
     pub fn is_directory(&self) -> bool {
         match self.components.last() {
             Some(p) => p.is_empty(),
@@ -362,6 +472,7 @@ impl fmt::Display for Path {
     }
 }
 
+/// Currently unused.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UrlSearchParams {}
 
@@ -371,6 +482,7 @@ impl fmt::Display for UrlSearchParams {
     }
 }
 
+/// Parses a scheme out of the current spec.
 fn parse_scheme(
     spec: &str,
     start_pos: &mut usize,
@@ -397,10 +509,13 @@ fn parse_scheme(
     Ok(Some(Scheme::from_str(scheme)?))
 }
 
+/// Helper to convert a `Option<Match>` to a `Option<String>`.
 fn map_match_to_string(option: Option<regex::Match>, _spec: &str) -> Option<String> {
-    option.map(|m| String::from(m.as_str()))
+    option.map(|m| m.as_str().to_owned())
 }
 
+/// Helper to convert a `Option<Match>` to a `Option<u32>` or an error if the
+/// text could not be converted to a `u32`.
 fn map_match_to_u32(option: Option<regex::Match>, spec: &str) -> UrlResult<Option<u32>> {
     match option {
         Some(m) => match m.as_str().parse::<u32>() {
@@ -411,6 +526,7 @@ fn map_match_to_u32(option: Option<regex::Match>, spec: &str) -> UrlResult<Optio
     }
 }
 
+/// Parses a host out of the current spec.
 fn parse_host(spec: &str, start_pos: &mut usize, end_pos: &mut usize) -> UrlResult<Option<Host>> {
     if end_pos < start_pos {
         return Err(UrlError::new("Parse failure (end < start).", spec));
@@ -434,7 +550,7 @@ fn parse_host(spec: &str, start_pos: &mut usize, end_pos: &mut usize) -> UrlResu
             Ok(Some(Host {
                 username: map_match_to_string(captures.get(1), spec),
                 password: map_match_to_string(captures.get(2), spec),
-                hostname: String::from(&captures[3]),
+                hostname: captures[3].to_owned(),
                 port: map_match_to_u32(captures.get(4), spec)?,
             }))
         }
@@ -442,6 +558,7 @@ fn parse_host(spec: &str, start_pos: &mut usize, end_pos: &mut usize) -> UrlResu
     }
 }
 
+/// Parses a path out of the current spec.
 fn parse_path(spec: &str, start_pos: &mut usize, end_pos: &mut usize) -> UrlResult<Path> {
     if end_pos < start_pos {
         return Err(UrlError::new("Parse failure (end < start).", spec));
@@ -453,7 +570,8 @@ fn parse_path(spec: &str, start_pos: &mut usize, end_pos: &mut usize) -> UrlResu
     Ok(Path::from(search))
 }
 
-fn parse_search(
+/// Parses a query string out of the current spec.
+fn parse_query(
     spec: &str,
     start_pos: &mut usize,
     end_pos: &mut usize,
@@ -474,9 +592,10 @@ fn parse_search(
     };
 
     *end_pos = frag_match.start();
-    Ok(Some(String::from(&frag_match.as_str()[1..])))
+    Ok(Some(frag_match.as_str()[1..].to_owned()))
 }
 
+/// Parses a fragment out of the current spec.
 fn parse_fragment(
     spec: &str,
     start_pos: &mut usize,
@@ -501,6 +620,59 @@ fn parse_fragment(
     Ok(Some(percent_decode(&frag_match.as_str()[1..])))
 }
 
+/// Low-level support for building and manipulating URLs.
+///
+/// The `UrlBuilder`is used by both [`Url`] and [`RelativeUrl`] to handle
+/// parsing, manipulating, serializing, splitting and joining URLs. In many
+/// cases you may not need to use this struct directly but it can be useful to
+/// get very low level access to the URL components.
+///
+/// As a low-level component however it has a more verbose API and you can shoot
+/// yourself in the foot. It is possible to build invalid URLs with this. Look
+/// to the [`is_absolute_url()`](#method.is_absolute_url) and
+/// [`is_relative()_url`](#method.is_relative_url) methods to see if the current
+/// state can be used as appropriate.
+///
+/// You can convert a [`UrlBuilder`] using the [`TryInto<Url>`](#impl-TryInto%3CUrl%3E)
+/// or [`TryInto<RelativeUrl>`](#impl-TryInto%3CRelativeUrl%3E) trait
+/// implementations.
+///
+/// # Examples
+///
+/// ```
+/// # use urlbuilder::UrlResult;
+/// use std::convert::TryInto;
+/// use urlbuilder::{Url, UrlBuilder};
+///
+/// # fn main() -> UrlResult<()> {
+/// let mut builder: UrlBuilder = Default::default();
+/// assert_eq!(builder.spec(), "");
+/// assert!(!builder.is_absolute_url());
+/// assert!(builder.is_relative_url());
+///
+/// builder.set_scheme(Some("http"))?;
+/// assert_eq!(builder.spec(), "http:");
+/// assert!(!builder.is_absolute_url());
+/// assert!(!builder.is_relative_url());
+///
+/// builder.set_path("/foo/bar")?;
+/// assert_eq!(builder.spec(), "http:/foo/bar");
+/// assert!(!builder.is_absolute_url());
+/// assert!(!builder.is_relative_url());
+///
+/// builder.set_hostname(Some("www.google.com"))?;
+/// assert!(builder.is_absolute_url());
+/// assert!(!builder.is_relative_url());
+///
+/// let url: Url = builder.try_into()?;
+/// assert_eq!(url.spec(), "http://www.google.com/foo/bar");
+///
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`Url`]: struct.Url.html
+/// [`RelativeUrl`]: struct.RelativeUrl.html
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct UrlBuilder {
     // All of these are percent decoded
@@ -510,11 +682,25 @@ pub struct UrlBuilder {
     fragment: Option<String>,
 
     // This remains percent encoded
-    search: Option<String>,
+    query: Option<String>,
 }
 
 impl UrlBuilder {
-    pub fn new(spec: &str) -> UrlResult<Self> {
+    /// Parses a URL spec to be parsed into a `UrlBuilder`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use urlbuilder::UrlResult;
+    /// use urlbuilder::UrlBuilder;
+    ///
+    /// # fn main() -> UrlResult<()> {
+    /// let mut builder = UrlBuilder::from_spec("https://www.google.com/")?;
+    /// assert_eq!(builder.scheme(), Some(String::from("https")));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_spec(spec: &str) -> UrlResult<Self> {
         let mut builder: UrlBuilder = Default::default();
 
         let c0_re = regex(&format!("^[{0} ]|[{0} ]$", C0_CONTROL))?;
@@ -538,7 +724,7 @@ impl UrlBuilder {
 
         // First parse out the optional end bits.
         builder.fragment = parse_fragment(spec, &mut start_pos, &mut end_pos)?;
-        builder.search = parse_search(spec, &mut start_pos, &mut end_pos)?;
+        builder.query = parse_query(spec, &mut start_pos, &mut end_pos)?;
 
         // Parse out scheme bits.
         builder.scheme = parse_scheme(spec, &mut start_pos, &mut end_pos)?;
@@ -560,15 +746,86 @@ impl UrlBuilder {
         Ok(builder)
     }
 
+    /// Normalises the path component of the URL.
+    ///
+    /// Removes any path components consisting of just `.` and components
+    /// consisting of `..` will remove the preceeding path component if there is
+    /// one. If the path is already absolute then any `..` components left at
+    /// the start of the path are dropped. They remain if the path is relative.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use urlbuilder::UrlResult;
+    /// use urlbuilder::UrlBuilder;
+    ///
+    /// # fn main() -> UrlResult<()> {
+    /// let mut builder = UrlBuilder::from_spec("/foo/../bar/")?;
+    /// builder.normalize();
+    /// assert_eq!(builder.spec(), "/bar/");
+    ///
+    /// builder.set_path("/foo/../../bar")?;
+    /// builder.normalize();
+    /// assert_eq!(builder.spec(), "/bar");
+    ///
+    /// builder.set_path("foo/../../bar")?;
+    /// builder.normalize();
+    /// assert_eq!(builder.spec(), "../bar");
+    ///
+    /// # Ok(())
+    /// # }
     pub fn normalize(&mut self) {
         self.path.normalize();
     }
 
-    pub fn get_spec(&self) -> String {
+    /// Serializes the current state of the builder into a string.
+    pub fn spec(&self) -> String {
         self.to_string()
     }
 
-    pub fn is_valid(&self) -> bool {
+    /// Tests whether this builder contains components that can make an absolute
+    /// URL.
+    pub fn is_absolute_url(&self) -> bool {
+        if self.scheme.is_none() {
+            return false;
+        }
+
+        if self.host.is_none() {
+            return false;
+        }
+
+        if self.path.is_relative() {
+            return false;
+        }
+
+        if let Some(ref h) = self.host {
+            match self.scheme {
+                Some(Scheme::File) => {
+                    if !h.hostname.is_empty() {
+                        return false;
+                    }
+                }
+                Some(Scheme::Special(_)) => {
+                    if h.hostname.is_empty() {
+                        return false;
+                    }
+                }
+                _ => (),
+            }
+        } else {
+            return false;
+        }
+
+        true
+    }
+
+    /// Tests whether this builder contains components that can make a relative
+    /// URL.
+    pub fn is_relative_url(&self) -> bool {
+        if self.scheme.is_some() {
+            return false;
+        }
+
         if self.host.is_some() && !self.path.is_absolute() {
             return false;
         }
@@ -576,38 +833,37 @@ impl UrlBuilder {
         true
     }
 
-    pub fn is_absolute_url(&self) -> bool {
-        if !self.is_valid() {
-            return false;
-        }
-
-        match self.scheme {
-            Some(ref scheme) => match scheme {
-                Scheme::File => {
-                    if self.path.is_absolute() {
-                        if let Some(ref h) = self.host {
-                            h.hostname.is_empty()
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                }
-                _ => self.host.is_some(),
-            },
-            None => false,
-        }
+    /// Tests whether this builder contains a path that can be considered to
+    /// reference a directory.
+    pub fn is_directory(&self) -> bool {
+        self.path.is_directory()
     }
 
-    pub fn is_relative_url(&self) -> bool {
-        if !self.is_valid() {
-            return false;
-        }
-
-        self.scheme.is_none()
-    }
-
+    /// Joins two `UrlBuilder`'s together.
+    ///
+    /// Treats the `relative` `UrlBuilder` as a relative URL and the current
+    /// `UrlBuilder` as the base URL to apply it to. No checks are made that
+    /// the current is an absolute URL and the `relative` a relative URL but the
+    /// results are undefined for the cases where that isn't the case.
+    ///
+    /// The basic pattern is to generate a new `UrlBuilder` preferring
+    /// `relative`'s scheme and host if available, always using `relative`'s
+    /// fragment and search and joining the paths.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use urlbuilder::UrlResult;
+    /// use urlbuilder::UrlBuilder;
+    ///
+    /// # fn main() -> UrlResult<()> {
+    /// let base = UrlBuilder::from_spec("https://www.google.com/foo/bar/?query#fragment")?;
+    /// let relative = UrlBuilder::from_spec("../baz#newfragment")?;
+    /// let joined = base.join(&relative)?;
+    /// assert_eq!(joined.spec(), "https://www.google.com/foo/baz#newfragment");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn join(&self, relative: &UrlBuilder) -> UrlResult<UrlBuilder> {
         let mut new_builder: UrlBuilder = Default::default();
 
@@ -625,11 +881,64 @@ impl UrlBuilder {
 
         new_builder.path = self.path.join(&relative.path)?;
         new_builder.fragment = relative.fragment.clone();
-        new_builder.search = relative.search.clone();
+        new_builder.query = relative.query.clone();
 
         Ok(new_builder)
     }
 
+    /// Generates a relative `UrlBuilder` between this and `base`.
+    ///
+    /// Tries to generate the simplest `UrlBuilder` which when joined with
+    /// `base` will return a `UrlBuilder` that is identical to this.
+    ///
+    /// The exact `UrlBuilder` returned is not stable, i.e. future versions of
+    /// this library may change exactly what is returned here.
+    ///
+    /// # Examples
+    ///
+    /// Note that this case manages to generate an identical relative `UrlBuilder`:
+    ///
+    /// ```
+    /// # use urlbuilder::UrlResult;
+    /// use urlbuilder::UrlBuilder;
+    ///
+    /// # fn main() -> UrlResult<()> {
+    /// let base = UrlBuilder::from_spec("https://www.google.com/foo/bar/?query#fragment")?;
+    /// let relative = UrlBuilder::from_spec("../baz#newfragment")?;
+    /// let joined = base.join(&relative)?;
+    /// assert_eq!(joined.spec(), "https://www.google.com/foo/baz#newfragment");
+    ///
+    /// let new_relative = joined.relative_to(&base)?;
+    /// let new_joined = base.join(&new_relative)?;
+    /// assert_eq!(new_joined, joined);
+    ///
+    /// assert_eq!(new_relative, relative);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The relative `UrlBuilder` used to join however and so the generated
+    /// relative `UrlBuilder` generated can differ and generally will be as
+    /// short as possible:
+    ///
+    /// ```
+    /// # use urlbuilder::UrlResult;
+    /// use urlbuilder::UrlBuilder;
+    ///
+    /// # fn main() -> UrlResult<()> {
+    /// let base = UrlBuilder::from_spec("https://www.microsoft.com/over/here")?;
+    /// let relative = UrlBuilder::from_spec("//www.microsoft.com/over/there")?;
+    /// let joined = base.join(&relative)?;
+    /// assert_eq!(joined.spec(), "https://www.microsoft.com/over/there");
+    ///
+    /// let new_relative = joined.relative_to(&base)?;
+    /// let new_joined = base.join(&new_relative)?;
+    /// assert_eq!(new_joined, joined);
+    ///
+    /// assert_eq!(new_relative.spec(), "there");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn relative_to(&self, base: &UrlBuilder) -> UrlResult<UrlBuilder> {
         let mut result: UrlBuilder = Default::default();
 
@@ -647,111 +956,180 @@ impl UrlBuilder {
             result.path = self.path.relative_to(&base.path)?;
         }
 
-        result.search = self.search.clone();
+        result.query = self.query.clone();
         result.fragment = self.fragment.clone();
 
         Ok(result)
     }
 
-    pub fn get_scheme(&self) -> Option<String> {
+    /// Gets the current scheme.
+    pub fn scheme(&self) -> Option<String> {
         self.scheme.as_ref().map(ToString::to_string)
     }
 
+    /// Sets the builder's scheme.
     pub fn set_scheme(&mut self, scheme: Option<&str>) -> UrlResult<()> {
         self.scheme = scheme.and_then(|s| Scheme::from(s));
         Ok(())
     }
 
-    pub fn get_username(&self) -> Option<String> {
+    /// Gets the builder's username.
+    pub fn username(&self) -> Option<String> {
         self.host.as_ref().and_then(|h| h.username.clone())
     }
 
-    pub fn set_username(&mut self, username: Option<String>) -> UrlResult<()> {
+    /// Sets the builder's username.
+    ///
+    /// URLs cannot contain a username unless they also have a non-empty
+    /// hostname so this method will return an error in that case.
+    pub fn set_username(&mut self, username: Option<&str>) -> UrlResult<()> {
+        if username.is_none() && self.host.is_none() {
+            return Ok(());
+        }
+
         match &mut self.host {
             Some(h) => {
-                h.username = username;
-                Ok(())
+                if username.is_some() && h.hostname.is_empty() {
+                    Err(UrlError::new(
+                        "Cannot set a username on a url with an empty hostname",
+                        &self.spec(),
+                    ))
+                } else {
+                    h.username = username.map(ToOwned::to_owned);
+                    Ok(())
+                }
             }
-            None => match username {
-                Some(_) => Err(UrlError::new(
+            None => {
+                // username must contain Some at this point or the bailout above
+                // would have triggered.
+                Err(UrlError::new(
                     "Cannot set a username on a url with no hostname",
-                    "",
-                )),
-                None => Ok(()),
-            },
+                    &self.spec(),
+                ))
+            }
         }
     }
 
-    pub fn get_password(&self) -> Option<String> {
+    /// Gets the builder's password.
+    pub fn password(&self) -> Option<String> {
         self.host.as_ref().and_then(|h| h.password.clone())
     }
 
-    pub fn set_password(&mut self, password: Option<String>) -> UrlResult<()> {
+    /// Sets the builder's password.
+    ///
+    /// URLs cannot contain a password unless they also have a non-empty
+    /// hostname so this method will return an error in that case.
+    pub fn set_password(&mut self, password: Option<&str>) -> UrlResult<()> {
+        if password.is_none() && self.host.is_none() {
+            return Ok(());
+        }
+
         match &mut self.host {
             Some(h) => {
-                h.password = password;
-                Ok(())
+                if password.is_some() && h.hostname.is_empty() {
+                    Err(UrlError::new(
+                        "Cannot set a password on a url with an empty hostname",
+                        &self.spec(),
+                    ))
+                } else {
+                    h.password = password.map(ToOwned::to_owned);
+                    Ok(())
+                }
             }
-            None => match password {
-                Some(_) => Err(UrlError::new(
+            None => {
+                // username must contain Some at this point or the bailout above
+                // would have triggered.
+                Err(UrlError::new(
                     "Cannot set a password on a url with no hostname",
-                    "",
-                )),
-                None => Ok(()),
-            },
+                    &self.spec(),
+                ))
+            }
         }
     }
 
-    pub fn get_hostname(&self) -> Option<String> {
+    /// Gets the builder's hostname.
+    pub fn hostname(&self) -> Option<String> {
         self.host.as_ref().and_then(|h| Some(h.hostname.clone()))
     }
 
-    pub fn set_hostname(&mut self, hostname: Option<String>) -> UrlResult<()> {
+    /// Sets the builder's hostname.
+    ///
+    /// Setting the hostname to None or an empty string will also set the
+    /// username, password and port to None.
+    pub fn set_hostname(&mut self, hostname: Option<&str>) -> UrlResult<()> {
         match hostname {
-            Some(h) => match &mut self.host {
-                Some(t) => t.hostname = h,
-                None => {
+            Some(h) => {
+                if h.is_empty() || self.host.is_none() {
                     self.host = Some(Host {
                         username: None,
                         password: None,
-                        hostname: h,
+                        hostname: h.to_owned(),
                         port: None,
-                    })
+                    });
+                } else if let Some(ref mut t) = self.host {
+                    t.hostname = h.to_owned();
                 }
-            },
+            }
             None => self.host = None,
-        };
+        }
 
         Ok(())
     }
 
-    pub fn get_port(&self) -> Option<u32> {
+    /// Gets the builder's port.
+    pub fn port(&self) -> Option<u32> {
         self.host.as_ref().and_then(|h| h.port)
     }
 
+    /// Sets the builder's port.
+    ///
+    /// URLs cannot contain a port unless they also have a non-empty hostname
+    /// so this method will return an error in that case.
     pub fn set_port(&mut self, port: Option<u32>) -> UrlResult<()> {
+        if port.is_none() && self.host.is_none() {
+            return Ok(());
+        }
+
         match &mut self.host {
             Some(h) => {
-                h.port = port;
-                Ok(())
+                if port.is_some() && h.hostname.is_empty() {
+                    Err(UrlError::new(
+                        "Cannot set a port on a url with an empty hostname",
+                        &self.spec(),
+                    ))
+                } else {
+                    h.port = port;
+                    Ok(())
+                }
             }
-            None => match port {
-                Some(_) => Err(UrlError::new(
+            None => {
+                // username must contain Some at this point or the bailout above
+                // would have triggered.
+                Err(UrlError::new(
                     "Cannot set a port on a url with no hostname",
-                    "",
-                )),
-                None => Ok(()),
-            },
+                    &self.spec(),
+                ))
+            }
         }
     }
 
-    pub fn get_active_port(&self) -> Option<u32> {
-        self.get_port()
-            .or_else(|| self.scheme.as_ref().and_then(Scheme::get_default_port))
+    /// Gets the builder's effective port.
+    ///
+    /// If a port is set in the builder then that is returned. If not a short
+    /// table of known ports for schemes is used. None is returns if neither
+    /// yielded a port.
+    pub fn effective_port(&self) -> Option<u32> {
+        self.port()
+            .or_else(|| self.scheme.as_ref().and_then(Scheme::default_port))
     }
 
-    pub fn set_active_port(&mut self, port: Option<u32>) -> UrlResult<()> {
-        let default = self.scheme.as_ref().and_then(Scheme::get_default_port);
+    /// Sets the builder's effective port.
+    ///
+    /// If the port given matches the default port for the current scheme then
+    /// the builder's port is cleared, otherwise this is the same as setting
+    /// the port directly.
+    pub fn set_effective_port(&mut self, port: Option<u32>) -> UrlResult<()> {
+        let default = self.scheme.as_ref().and_then(Scheme::default_port);
         if port == default {
             self.set_port(port)
         } else {
@@ -759,38 +1137,44 @@ impl UrlBuilder {
         }
     }
 
-    pub fn get_path(&self) -> Path {
-        self.path.clone()
+    /// Gets the builder's path.
+    pub fn path(&self) -> String {
+        self.path.to_string()
     }
 
-    pub fn set_path(&mut self, path: Path) -> UrlResult<()> {
-        self.path = path;
+    /// Sets the builder's path.
+    pub fn set_path(&mut self, path: &str) -> UrlResult<()> {
+        self.path = Path::from(path);
         Ok(())
     }
 
-    pub fn get_search(&self) -> Option<String> {
-        self.search.clone()
+    /// Gets the builders query string.
+    pub fn query(&self) -> Option<String> {
+        self.query.clone()
     }
 
-    pub fn set_search(&mut self, search: Option<String>) -> UrlResult<()> {
-        self.search = search;
+    /// Sets the builder's query string.
+    pub fn set_query(&mut self, query: Option<&str>) -> UrlResult<()> {
+        self.query = query.map(ToOwned::to_owned);
         Ok(())
     }
 
-    pub fn get_fragment(&self) -> Option<String> {
+    /// Gete the builder's fragment string.
+    pub fn fragment(&self) -> Option<String> {
         self.fragment.clone()
     }
 
-    pub fn set_fragment(&mut self, fragment: Option<String>) -> UrlResult<()> {
-        self.fragment = fragment;
+    /// Sets the builder's fragment string.
+    pub fn set_fragment(&mut self, fragment: Option<&str>) -> UrlResult<()> {
+        self.fragment = fragment.map(ToOwned::to_owned);
         Ok(())
     }
 }
 
+/// These are method implementations used by `Url` and `UrlBuilder`.
 impl UrlBuilder {
-    fn get_url_protocol(&self) -> String {
-        self.get_scheme()
-            .map_or(String::new(), |s| format!("{}:", s))
+    fn url_protocol(&self) -> String {
+        self.scheme().map_or(String::new(), |s| format!("{}:", s))
     }
 
     fn set_url_protocol(&mut self, scheme: &str) -> UrlResult<()> {
@@ -813,8 +1197,8 @@ impl UrlBuilder {
         Ok(())
     }
 
-    fn get_url_username(&self) -> String {
-        self.get_username().unwrap_or_default()
+    fn url_username(&self) -> String {
+        self.username().unwrap_or_default()
     }
 
     fn set_url_username(&mut self, username: &str) -> UrlResult<()> {
@@ -823,15 +1207,15 @@ impl UrlBuilder {
         } else if self.scheme == Some(Scheme::File) {
             Err(UrlError::new(
                 "Cannot set a username for a file url.",
-                &self.get_spec(),
+                &self.spec(),
             ))
         } else {
-            self.set_username(Some(String::from(username)))
+            self.set_username(Some(username))
         }
     }
 
-    fn get_url_password(&self) -> String {
-        self.get_password().unwrap_or_default()
+    fn url_password(&self) -> String {
+        self.password().unwrap_or_default()
     }
 
     fn set_url_password(&mut self, password: &str) -> UrlResult<()> {
@@ -840,15 +1224,15 @@ impl UrlBuilder {
         } else if self.scheme == Some(Scheme::File) {
             Err(UrlError::new(
                 "Cannot set a password for a file url.",
-                &self.get_spec(),
+                &self.spec(),
             ))
         } else {
-            self.set_password(Some(String::from(password)))
+            self.set_password(Some(password))
         }
     }
 
-    fn get_url_hostname(&self) -> String {
-        self.get_hostname().unwrap_or_default()
+    fn url_hostname(&self) -> String {
+        self.hostname().unwrap_or_default()
     }
 
     fn set_url_hostname(&mut self, hostname: &str) -> UrlResult<()> {
@@ -857,15 +1241,15 @@ impl UrlBuilder {
         } else if self.scheme == Some(Scheme::File) {
             Err(UrlError::new(
                 "Cannot set a hostname for a file url.",
-                &self.get_spec(),
+                &self.spec(),
             ))
         } else {
-            self.set_hostname(Some(String::from(hostname)))
+            self.set_hostname(Some(hostname))
         }
     }
 
-    fn get_url_port(&self) -> String {
-        self.get_port().map_or(String::new(), |p| p.to_string())
+    fn url_port(&self) -> String {
+        self.port().map_or(String::new(), |p| p.to_string())
     }
 
     fn set_url_port(&mut self, port: &str) -> UrlResult<()> {
@@ -874,7 +1258,7 @@ impl UrlBuilder {
         } else if self.scheme == Some(Scheme::File) {
             Err(UrlError::new(
                 "Cannot set a port for a file url.",
-                &self.get_spec(),
+                &self.spec(),
             ))
         } else {
             match port.parse::<u32>() {
@@ -884,8 +1268,8 @@ impl UrlBuilder {
         }
     }
 
-    fn get_url_host(&self) -> String {
-        self.host.as_ref().map_or(String::new(), Host::get_hostport)
+    fn url_host(&self) -> String {
+        self.host.as_ref().map_or(String::new(), Host::hostport)
     }
 
     fn set_url_host(&mut self, host: &str) -> UrlResult<()> {
@@ -894,18 +1278,18 @@ impl UrlBuilder {
         } else {
             match host.find(':') {
                 Some(i) => {
-                    self.set_hostname(Some(String::from(&host[..i])))?;
+                    self.set_hostname(Some(&host[..i]))?;
                     self.set_url_port(&host[i + 1..])
                 }
                 None => {
-                    self.set_hostname(Some(String::from(host)))?;
+                    self.set_hostname(Some(host))?;
                     self.set_port(None)
                 }
             }
         }
     }
 
-    fn get_url_pathname(&self) -> String {
+    fn url_pathname(&self) -> String {
         self.path.to_string()
     }
 
@@ -914,25 +1298,25 @@ impl UrlBuilder {
         Ok(())
     }
 
-    fn get_url_search(&self) -> String {
-        self.search
+    fn url_search(&self) -> String {
+        self.query
             .as_ref()
             .map_or(String::new(), |s| format!("?{}", s))
     }
 
     fn set_url_search(&mut self, search: &str) -> UrlResult<()> {
         if search.is_empty() {
-            self.search = None
+            self.query = None
         } else if search.starts_with('?') {
-            self.search = Some(String::from(&search[1..]));
+            self.query = Some(search[1..].to_owned());
         } else {
-            self.search = Some(String::from(search));
+            self.query = Some(search.to_owned());
         }
 
         Ok(())
     }
 
-    fn get_url_hash(&self) -> String {
+    fn url_hash(&self) -> String {
         self.fragment
             .as_ref()
             .map_or(String::new(), |f| format!("#{}", percent_encode(&f)))
@@ -942,9 +1326,9 @@ impl UrlBuilder {
         if hash.is_empty() {
             self.fragment = None;
         } else if hash.starts_with('#') {
-            self.fragment = Some(String::from(&hash[1..]));
+            self.fragment = Some(hash[1..].to_owned());
         } else {
-            self.fragment = Some(String::from(hash));
+            self.fragment = Some(hash.to_owned());
         }
 
         Ok(())
@@ -964,7 +1348,7 @@ impl fmt::Display for UrlBuilder {
 
         self.path.fmt(f)?;
 
-        if let Some(ref s) = self.search {
+        if let Some(ref s) = self.query {
             f.write_fmt(format_args!("?{}", &percent_encode(&s)))?;
         }
 
@@ -976,88 +1360,221 @@ impl fmt::Display for UrlBuilder {
     }
 }
 
-impl TryFrom<&str> for UrlBuilder {
-    type Error = UrlError;
-
-    fn try_from(spec: &str) -> Result<Self, Self::Error> {
-        UrlBuilder::new(spec)
-    }
-}
-
 impl FromStr for UrlBuilder {
     type Err = UrlError;
 
     fn from_str(spec: &str) -> Result<Self, Self::Err> {
-        UrlBuilder::try_from(spec)
+        UrlBuilder::from_spec(spec)
     }
 }
 
-impl TryInto<Url> for UrlBuilder {
+impl TryFrom<UrlBuilder> for Url {
     type Error = UrlError;
 
-    fn try_into(self) -> Result<Url, Self::Error> {
-        if self.is_relative_url() {
-            Ok(Url { builder: self })
+    fn try_from(builder: UrlBuilder) -> Result<Url, Self::Error> {
+        if builder.is_absolute_url() {
+            Ok(Url { builder })
         } else {
             Err(UrlError::new(
-                "Unable to build an absolute url.",
-                &self.get_spec(),
+                "Unable to build an absolute url from this builder.",
+                &builder.spec(),
             ))
         }
     }
 }
 
-impl TryInto<RelativeUrl> for UrlBuilder {
+impl TryFrom<UrlBuilder> for RelativeUrl {
     type Error = UrlError;
 
-    fn try_into(self) -> Result<RelativeUrl, Self::Error> {
-        if self.is_absolute_url() {
-            Ok(RelativeUrl { builder: self })
+    fn try_from(builder: UrlBuilder) -> Result<RelativeUrl, Self::Error> {
+        if builder.is_relative_url() {
+            Ok(RelativeUrl { builder })
         } else {
             Err(UrlError::new(
-                "Unable to build a relative url.",
-                &self.get_spec(),
+                "Unable to build a relative url from this builder.",
+                &builder.spec(),
             ))
         }
     }
 }
 
-#[derive(Debug, Clone)]
+impl From<Url> for UrlBuilder {
+    fn from(url: Url) -> UrlBuilder {
+        url.builder
+    }
+}
+
+impl From<RelativeUrl> for UrlBuilder {
+    fn from(url: RelativeUrl) -> UrlBuilder {
+        url.builder
+    }
+}
+
+/// Represents an absolute URL.
+///
+/// The API largely matches the specification for [URL objects](https://developer.mozilla.org/en-US/docs/Web/API/URL)
+/// in web pages with the exception that setting properties may return an error
+/// if setting the property is invalid whereas the web API simply ignores such
+/// attempts.
+///
+/// # Examples
+///
+/// ```
+/// # use urlbuilder::UrlResult;
+/// use urlbuilder::{UrlBuilder, Url};
+/// use std::convert::TryFrom;
+///
+/// # fn main() -> UrlResult<()> {
+/// // A few different ways of creating the same `Url`:
+/// let spec = "https://www.google.com/foo#bar";
+/// let url = Url::new(spec, None)?;
+/// assert_eq!(url.href(), spec);
+///
+/// assert_eq!(Url::new("#bar", "https://www.google.com/foo")?, url);
+///
+/// assert_eq!(spec.parse::<Url>()?, url);
+///
+/// let mut builder: UrlBuilder = Default::default();
+/// builder.set_scheme(Some("https"))?;
+/// builder.set_hostname(Some("www.google.com"))?;
+/// builder.set_path("/foo")?;
+/// builder.set_fragment(Some("bar"))?;
+/// assert_eq!(Url::try_from(builder)?, url);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
 pub struct Url {
     builder: UrlBuilder,
 }
 
 impl Url {
-    pub fn new(spec: &str, base_url: Option<&str>) -> UrlResult<Self> {
-        match base_url {
-            Some(s) => Url::try_from(s)?.join(&RelativeUrl::try_from(spec)?),
-            None => Url::try_from(spec),
+    /// Creates a new `Url` from a spec and optionally a spec to resolve
+    /// against.
+    ///
+    /// The `spec` is first parsed. If it represents an absolute URL then a
+    /// `Url` for that is returned. If it represents a relative URL and
+    /// `base_spec` is provided and can be parsed to an absolute URL then a
+    /// `Url` that represents the join of `spec` to `base_spec` is returned.
+    /// Otherwise an error is thrown.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use urlbuilder::UrlResult;
+    /// use urlbuilder::Url;
+    ///
+    /// # fn main() -> UrlResult<()> {
+    /// let url = Url::new("https://www.microsoft.com", None)?;
+    /// assert_eq!(url.spec(), "https://www.microsoft.com/");
+    ///
+    /// let url = Url::new("#foo", "https://www.google.com")?;
+    /// assert_eq!(url.spec(), "https://www.google.com/#foo");
+    ///
+    /// let url = Url::new("https://www.microsoft.com", "https://www.google.com")?;
+    /// assert_eq!(url.spec(), "https://www.microsoft.com/");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new<'a, O>(spec: &str, base_url: O) -> UrlResult<Self>
+    where
+        O: Into<Option<&'a str>>,
+    {
+        let spec_builder = spec.parse::<UrlBuilder>()?;
+        if spec_builder.is_absolute_url() {
+            spec_builder.try_into()
+        } else if spec_builder.is_relative_url() {
+            match base_url.into() {
+                Some(s) => {
+                    let base_builder = s.parse::<UrlBuilder>()?;
+                    if base_builder.is_absolute_url() {
+                        base_builder.join(&spec_builder)?.try_into()
+                    } else {
+                        Err(UrlError::new(
+                            "Base specification did not parse into an absolute URL.",
+                            s,
+                        ))
+                    }
+                }
+                None => Err(UrlError::new(
+                    "Specification parsed as a relative URL but no base URL was provided.",
+                    spec,
+                )),
+            }
+        } else {
+            Err(UrlError::new(
+                "Specification did not parse as an absolute or relative URL.",
+                spec,
+            ))
         }
     }
 
-    pub fn get_builder(&self) -> UrlBuilder {
-        self.builder.clone()
+    /// Returns the serialized spec for the current `Url`.
+    pub fn spec(&self) -> String {
+        self.builder.spec()
     }
 
-    pub fn get_spec(&self) -> String {
-        self.builder.get_spec()
+    /// Returns the serialized spec for the current `Url`.
+    pub fn href(&self) -> String {
+        self.spec()
     }
 
-    pub fn get_href(&self) -> String {
-        self.get_spec()
-    }
-
+    /// Joins a relative URL to this URL to create a new `Url`.
+    ///
+    /// Internally this joins the `Url`'s [`UrlBuilder`](struct.UrlBuilder.html)
+    /// to `relative`'s [`UrlBuilder`](struct.UrlBuilder.html) and then converts
+    /// the result into a `Url`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use urlbuilder::UrlResult;
+    /// use urlbuilder::{ Url, RelativeUrl };
+    ///
+    /// # fn main() -> UrlResult<()> {
+    /// let base: Url = "https://www.google.com/foo/bar/".parse()?;
+    /// let relative: RelativeUrl = "../baz/bam".parse()?;
+    ///
+    /// let joined = base.join(&relative)?;
+    /// assert_eq!(joined.spec(), "https://www.google.com/foo/baz/bam");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn join(&self, relative: &RelativeUrl) -> UrlResult<Self> {
         let builder = self.builder.join(&relative.builder)?;
         builder.try_into()
     }
 
+    /// Creates a relative URL that can be joined to `base` to create a `Url`
+    /// containing the current URL.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use urlbuilder::UrlResult;
+    /// use urlbuilder::{ Url, RelativeUrl };
+    ///
+    /// # fn main() -> UrlResult<()> {
+    /// let base: Url = "https://www.google.com/foo/bar/".parse()?;
+    /// let current: Url = "https://www.google.com/foo/baz/bam".parse()?;
+    ///
+    /// let relative = current.relative_to(&base)?;
+    /// assert_eq!(relative.spec(), "../baz/bam");
+    ///
+    /// let joined = base.join(&relative)?;
+    /// assert_eq!(joined, current);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn relative_to(&self, base: &Url) -> UrlResult<RelativeUrl> {
         let builder = self.builder.relative_to(&base.builder)?;
         builder.try_into()
     }
 
-    pub fn get_origin(&self) -> String {
+    /// Returns the current `Url`'s origin.
+    ///
+    /// Matches the web specification for [`origin`](https://developer.mozilla.org/en-US/docs/Web/API/URL/origin).
+    pub fn origin(&self) -> String {
         assert!(
             self.builder.is_absolute_url(),
             "Url should be absolute to have an origin."
@@ -1065,7 +1582,7 @@ impl Url {
 
         format!(
             "{}{}",
-            self.builder.get_url_protocol(),
+            self.builder.url_protocol(),
             self.builder
                 .host
                 .as_ref()
@@ -1075,10 +1592,16 @@ impl Url {
 }
 
 impl Url {
-    pub fn get_protocol(&self) -> String {
-        self.builder.get_url_protocol()
+    /// Returns the current `Url`'s protocol.
+    ///
+    /// Matches the web specification for [`protocol`](https://developer.mozilla.org/en-US/docs/Web/API/URL/protocol).
+    pub fn protocol(&self) -> String {
+        self.builder.url_protocol()
     }
 
+    /// Sets the current `Url`'s protocol.
+    ///
+    /// Matches the web specification for [`protocol`](https://developer.mozilla.org/en-US/docs/Web/API/URL/protocol).
     pub fn set_protocol(&mut self, scheme: &str) -> UrlResult<()> {
         self.builder.set_url_protocol(scheme)?;
         assert!(
@@ -1088,10 +1611,16 @@ impl Url {
         Ok(())
     }
 
-    pub fn get_username(&self) -> String {
-        self.builder.get_url_username()
+    /// Returns the current `Url`'s username.
+    ///
+    /// Matches the web specification for [`username`](https://developer.mozilla.org/en-US/docs/Web/API/URL/username).
+    pub fn username(&self) -> String {
+        self.builder.url_username()
     }
 
+    /// Sets the current `Url`'s username.
+    ///
+    /// Matches the web specification for [`username`](https://developer.mozilla.org/en-US/docs/Web/API/URL/username).
     pub fn set_username(&mut self, username: &str) -> UrlResult<()> {
         self.builder.set_url_username(username)?;
         assert!(
@@ -1101,10 +1630,16 @@ impl Url {
         Ok(())
     }
 
-    pub fn get_password(&self) -> String {
-        self.builder.get_url_password()
+    /// Returns the current `Url`'s password.
+    ///
+    /// Matches the web specification for [`password`](https://developer.mozilla.org/en-US/docs/Web/API/URL/password).
+    pub fn password(&self) -> String {
+        self.builder.url_password()
     }
 
+    /// Sets the current `Url`'s password.
+    ///
+    /// Matches the web specification for [`password`](https://developer.mozilla.org/en-US/docs/Web/API/URL/password).
     pub fn set_password(&mut self, password: &str) -> UrlResult<()> {
         self.builder.set_url_password(password)?;
         assert!(
@@ -1114,10 +1649,16 @@ impl Url {
         Ok(())
     }
 
-    pub fn get_hostname(&self) -> String {
-        self.builder.get_url_hostname()
+    /// Returns the current `Url`'s hostname.
+    ///
+    /// Matches the web specification for [`hostname`](https://developer.mozilla.org/en-US/docs/Web/API/URL/hostname).
+    pub fn hostname(&self) -> String {
+        self.builder.url_hostname()
     }
 
+    /// Sets the current `Url`'s hostname.
+    ///
+    /// Matches the web specification for [`hostname`](https://developer.mozilla.org/en-US/docs/Web/API/URL/hostname).
     pub fn set_hostname(&mut self, hostname: &str) -> UrlResult<()> {
         self.builder.set_url_hostname(hostname)?;
         assert!(
@@ -1127,10 +1668,16 @@ impl Url {
         Ok(())
     }
 
-    pub fn get_port(&self) -> String {
-        self.builder.get_url_port()
+    /// Returns the current `Url`'s port.
+    ///
+    /// Matches the web specification for [`port`](https://developer.mozilla.org/en-US/docs/Web/API/URL/port).
+    pub fn port(&self) -> String {
+        self.builder.url_port()
     }
 
+    /// Sets the current `Url`'s port.
+    ///
+    /// Matches the web specification for [`port`](https://developer.mozilla.org/en-US/docs/Web/API/URL/port).
     pub fn set_port(&mut self, port: &str) -> UrlResult<()> {
         self.builder.set_url_port(port)?;
         assert!(
@@ -1140,10 +1687,16 @@ impl Url {
         Ok(())
     }
 
-    pub fn get_host(&self) -> String {
-        self.builder.get_url_host()
+    /// Returns the current `Url`'s host.
+    ///
+    /// Matches the web specification for [`host`](https://developer.mozilla.org/en-US/docs/Web/API/URL/host).
+    pub fn host(&self) -> String {
+        self.builder.url_host()
     }
 
+    /// Sets the current `Url`'s host.
+    ///
+    /// Matches the web specification for [`host`](https://developer.mozilla.org/en-US/docs/Web/API/URL/host).
     pub fn set_host(&mut self, host: &str) -> UrlResult<()> {
         self.builder.set_url_host(host)?;
         assert!(
@@ -1153,10 +1706,16 @@ impl Url {
         Ok(())
     }
 
-    pub fn get_pathname(&self) -> String {
-        self.builder.get_url_pathname()
+    /// Returns the current `Url`'s pathname.
+    ///
+    /// Matches the web specification for [`pathname`](https://developer.mozilla.org/en-US/docs/Web/API/URL/pathname).
+    pub fn pathname(&self) -> String {
+        self.builder.url_pathname()
     }
 
+    /// Sets the current `Url`'s pathname.
+    ///
+    /// Matches the web specification for [`pathname`](https://developer.mozilla.org/en-US/docs/Web/API/URL/pathname).
     pub fn set_pathname(&mut self, path: &str) -> UrlResult<()> {
         self.builder.set_url_pathname(path)?;
         assert!(
@@ -1166,10 +1725,16 @@ impl Url {
         Ok(())
     }
 
-    pub fn get_search(&self) -> String {
-        self.builder.get_url_search()
+    /// Returns the current `Url`'s search.
+    ///
+    /// Matches the web specification for [`search`](https://developer.mozilla.org/en-US/docs/Web/API/URL/search).
+    pub fn search(&self) -> String {
+        self.builder.url_search()
     }
 
+    /// Sets the current `Url`'s search.
+    ///
+    /// Matches the web specification for [`search`](https://developer.mozilla.org/en-US/docs/Web/API/URL/search).
     pub fn set_search(&mut self, search: &str) -> UrlResult<()> {
         self.builder.set_url_search(search)?;
         assert!(
@@ -1179,10 +1744,16 @@ impl Url {
         Ok(())
     }
 
-    pub fn get_hash(&self) -> String {
-        self.builder.get_url_hash()
+    /// Returns the current `Url`'s hash.
+    ///
+    /// Matches the web specification for [`hash`](https://developer.mozilla.org/en-US/docs/Web/API/URL/hash).
+    pub fn hash(&self) -> String {
+        self.builder.url_hash()
     }
 
+    /// Sets the current `Url`'s hash.
+    ///
+    /// Matches the web specification for [`hash`](https://developer.mozilla.org/en-US/docs/Web/API/URL/hash).
     pub fn set_hash(&mut self, hash: &str) -> UrlResult<()> {
         self.builder.set_url_hash(hash)?;
         assert!(
@@ -1193,26 +1764,18 @@ impl Url {
     }
 }
 
-impl TryFrom<&str> for Url {
-    type Error = UrlError;
-
-    fn try_from(spec: &str) -> Result<Self, Self::Error> {
-        let builder = UrlBuilder::try_from(spec)?;
-        builder.try_into()
-    }
-}
-
 impl FromStr for Url {
     type Err = UrlError;
 
     fn from_str(spec: &str) -> Result<Self, Self::Err> {
-        Url::try_from(spec)
+        let builder: UrlBuilder = spec.parse()?;
+        builder.try_into()
     }
 }
 
 impl fmt::Display for Url {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        f.write_str(&self.get_href())
+        f.write_str(&self.href())
     }
 }
 
@@ -1222,20 +1785,23 @@ pub struct RelativeUrl {
 }
 
 impl RelativeUrl {
-    pub fn new(spec: &str) -> UrlResult<Self> {
-        RelativeUrl::try_from(spec)
-    }
-
-    pub fn get_builder(&self) -> UrlBuilder {
-        self.builder.clone()
+    /// Returns the serialized spec for the current `RelativeUrl`.
+    pub fn spec(&self) -> String {
+        self.to_string()
     }
 }
 
 impl RelativeUrl {
-    pub fn get_username(&self) -> String {
-        self.builder.get_url_username()
+    /// Returns the current `RelativeUrl`'s username.
+    ///
+    /// Matches the web specification for [`username`](https://developer.mozilla.org/en-US/docs/Web/API/URL/username).
+    pub fn username(&self) -> String {
+        self.builder.url_username()
     }
 
+    /// Sets the current `RelativeUrl`'s username.
+    ///
+    /// Matches the web specification for [`username`](https://developer.mozilla.org/en-US/docs/Web/API/URL/username).
     pub fn set_username(&mut self, username: &str) -> UrlResult<()> {
         self.builder.set_url_username(username)?;
         assert!(
@@ -1245,10 +1811,16 @@ impl RelativeUrl {
         Ok(())
     }
 
-    pub fn get_password(&self) -> String {
-        self.builder.get_url_password()
+    /// Returns the current `RelativeUrl`'s password.
+    ///
+    /// Matches the web specification for [`password`](https://developer.mozilla.org/en-US/docs/Web/API/URL/password).
+    pub fn password(&self) -> String {
+        self.builder.url_password()
     }
 
+    /// Sets the current `RelativeUrl`'s password.
+    ///
+    /// Matches the web specification for [`password`](https://developer.mozilla.org/en-US/docs/Web/API/URL/password).
     pub fn set_password(&mut self, password: &str) -> UrlResult<()> {
         self.builder.set_url_password(password)?;
         assert!(
@@ -1258,10 +1830,16 @@ impl RelativeUrl {
         Ok(())
     }
 
-    pub fn get_hostname(&self) -> String {
-        self.builder.get_url_hostname()
+    /// Returns the current `RelativeUrl`'s hostname.
+    ///
+    /// Matches the web specification for [`hostname`](https://developer.mozilla.org/en-US/docs/Web/API/URL/hostname).
+    pub fn hostname(&self) -> String {
+        self.builder.url_hostname()
     }
 
+    /// Sets the current `RelativeUrl`'s hostname.
+    ///
+    /// Matches the web specification for [`hostname`](https://developer.mozilla.org/en-US/docs/Web/API/URL/hostname).
     pub fn set_hostname(&mut self, hostname: &str) -> UrlResult<()> {
         self.builder.set_url_hostname(hostname)?;
         assert!(
@@ -1271,10 +1849,16 @@ impl RelativeUrl {
         Ok(())
     }
 
-    pub fn get_port(&self) -> String {
-        self.builder.get_url_port()
+    /// Returns the current `RelativeUrl`'s port.
+    ///
+    /// Matches the web specification for [`port`](https://developer.mozilla.org/en-US/docs/Web/API/URL/port).
+    pub fn port(&self) -> String {
+        self.builder.url_port()
     }
 
+    /// Sets the current `RelativeUrl`'s port.
+    ///
+    /// Matches the web specification for [`port`](https://developer.mozilla.org/en-US/docs/Web/API/URL/port).
     pub fn set_port(&mut self, port: &str) -> UrlResult<()> {
         self.builder.set_url_port(port)?;
         assert!(
@@ -1284,10 +1868,16 @@ impl RelativeUrl {
         Ok(())
     }
 
-    pub fn get_host(&self) -> String {
-        self.builder.get_url_host()
+    /// Returns the current `RelativeUrl`'s host.
+    ///
+    /// Matches the web specification for [`host`](https://developer.mozilla.org/en-US/docs/Web/API/URL/host).
+    pub fn host(&self) -> String {
+        self.builder.url_host()
     }
 
+    /// Sets the current `RelativeUrl`'s host.
+    ///
+    /// Matches the web specification for [`host`](https://developer.mozilla.org/en-US/docs/Web/API/URL/host).
     pub fn set_host(&mut self, host: &str) -> UrlResult<()> {
         self.builder.set_url_host(host)?;
         assert!(
@@ -1297,10 +1887,16 @@ impl RelativeUrl {
         Ok(())
     }
 
-    pub fn get_pathname(&self) -> String {
-        self.builder.get_url_pathname()
+    /// Returns the current `RelativeUrl`'s pathname.
+    ///
+    /// Matches the web specification for [`pathname`](https://developer.mozilla.org/en-US/docs/Web/API/URL/pathname).
+    pub fn pathname(&self) -> String {
+        self.builder.url_pathname()
     }
 
+    /// Sets the current `RelativeUrl`'s pathname.
+    ///
+    /// Matches the web specification for [`pathname`](https://developer.mozilla.org/en-US/docs/Web/API/URL/pathname).
     pub fn set_pathname(&mut self, path: &str) -> UrlResult<()> {
         self.builder.set_url_pathname(path)?;
         assert!(
@@ -1310,10 +1906,16 @@ impl RelativeUrl {
         Ok(())
     }
 
-    pub fn get_search(&self) -> String {
-        self.builder.get_url_search()
+    /// Returns the current `RelativeUrl`'s search.
+    ///
+    /// Matches the web specification for [`search`](https://developer.mozilla.org/en-US/docs/Web/API/URL/search).
+    pub fn search(&self) -> String {
+        self.builder.url_search()
     }
 
+    /// Sets the current `RelativeUrl`'s search.
+    ///
+    /// Matches the web specification for [`search`](https://developer.mozilla.org/en-US/docs/Web/API/URL/search).
     pub fn set_search(&mut self, search: &str) -> UrlResult<()> {
         self.builder.set_url_search(search)?;
         assert!(
@@ -1323,10 +1925,16 @@ impl RelativeUrl {
         Ok(())
     }
 
-    pub fn get_hash(&self) -> String {
-        self.builder.get_url_hash()
+    /// Returns the current `RelativeUrl`'s hash.
+    ///
+    /// Matches the web specification for [`hash`](https://developer.mozilla.org/en-US/docs/Web/API/URL/hash).
+    pub fn hash(&self) -> String {
+        self.builder.url_hash()
     }
 
+    /// Sets the current `RelativeUrl`'s hash.
+    ///
+    /// Matches the web specification for [`hash`](https://developer.mozilla.org/en-US/docs/Web/API/URL/hash).
     pub fn set_hash(&mut self, hash: &str) -> UrlResult<()> {
         self.builder.set_url_hash(hash)?;
         assert!(
@@ -1337,26 +1945,18 @@ impl RelativeUrl {
     }
 }
 
-impl TryFrom<&str> for RelativeUrl {
-    type Error = UrlError;
-
-    fn try_from(spec: &str) -> Result<Self, Self::Error> {
-        let builder = UrlBuilder::try_from(spec)?;
-        builder.try_into()
-    }
-}
-
 impl FromStr for RelativeUrl {
     type Err = UrlError;
 
     fn from_str(spec: &str) -> Result<Self, Self::Err> {
-        RelativeUrl::try_from(spec)
+        let builder: UrlBuilder = spec.parse()?;
+        builder.try_into()
     }
 }
 
 impl fmt::Display for RelativeUrl {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        self.get_builder().fmt(f)
+        self.builder.fmt(f)
     }
 }
 
@@ -1373,11 +1973,11 @@ mod test {
     fn builder_parse_change(spec: &str, expected: &str) -> UrlBuilder {
         let builder = spec.parse::<UrlBuilder>().unwrap();
         assert_eq!(
-            &builder.get_spec(),
+            &builder.spec(),
             expected,
             "Parsed spec should match expected."
         );
-        let reparsed = builder.get_spec().parse::<UrlBuilder>().unwrap();
+        let reparsed = builder.spec().parse::<UrlBuilder>().unwrap();
         assert_eq!(builder, reparsed, "Reparsed builder should match original.");
         builder
     }
@@ -1406,7 +2006,7 @@ mod test {
                     port: Some(24),
                 }),
                 path: build_path(vec!["", "foo", "bar"]),
-                search: Some(String::from("zed")),
+                query: Some(String::from("zed")),
                 fragment: Some(String::from("frag")),
             },
         );
@@ -1429,7 +2029,7 @@ mod test {
                     port: None,
                 }),
                 path: build_path(vec!["", ""]),
-                search: None,
+                query: None,
                 fragment: None,
             }
         );
@@ -1452,7 +2052,7 @@ mod test {
                     port: None,
                 }),
                 path: build_path(vec!["", "foo", "bar"]),
-                search: None,
+                query: None,
                 fragment: None,
             }
         );
@@ -1478,7 +2078,7 @@ mod test {
                     port: None,
                 }),
                 path: build_path(vec!["", "example"]),
-                search: None,
+                query: None,
                 fragment: None,
             }
         );
@@ -1496,7 +2096,7 @@ mod test {
                 scheme: None,
                 host: None,
                 path: build_path(vec!["", "www", "example"]),
-                search: None,
+                query: None,
                 fragment: None,
             }
         );
@@ -1514,7 +2114,7 @@ mod test {
                 scheme: None,
                 host: None,
                 path: build_path(vec!["www", "example", ""]),
-                search: None,
+                query: None,
                 fragment: None,
             }
         );
@@ -1523,7 +2123,6 @@ mod test {
     #[test]
     fn builder_parse_bad_urls() {
         let builder = builder_parse("file:");
-        assert!(builder.is_valid());
         assert!(!builder.is_absolute_url());
         assert!(!builder.is_relative_url());
         assert!(builder.path.is_empty());
@@ -1536,13 +2135,12 @@ mod test {
                 scheme: Some(Scheme::File),
                 host: None,
                 path: Default::default(),
-                search: None,
+                query: None,
                 fragment: None,
             }
         );
 
         let builder = builder_parse("file://foo/bar/");
-        assert!(builder.is_valid());
         assert!(!builder.is_absolute_url());
         assert!(!builder.is_relative_url());
         assert!(!builder.path.is_empty());
@@ -1560,17 +2158,17 @@ mod test {
                     port: None,
                 }),
                 path: build_path(vec!["", "bar", ""]),
-                search: None,
+                query: None,
                 fragment: None,
             }
         );
     }
 
     fn check_normalize(spec: &str, expected: &str) {
-        let mut builder = UrlBuilder::new(spec).unwrap();
+        let mut builder: UrlBuilder = spec.parse().unwrap();
         builder.normalize();
         assert_eq!(
-            builder.get_spec(),
+            builder.spec(),
             expected,
             "Normalized spec should have matched expected."
         );
@@ -1600,13 +2198,13 @@ mod test {
     }
 
     fn check_join_split(base: &str, relative: &str, expected: &str, after_split: &str) {
-        let base_builder = UrlBuilder::new(base).unwrap();
-        let relative_builder = UrlBuilder::new(relative).unwrap();
+        let base_builder: UrlBuilder = base.parse().unwrap();
+        let relative_builder: UrlBuilder = relative.parse().unwrap();
 
         let joined = base_builder.join(&relative_builder).unwrap();
 
         assert_eq!(
-            joined.get_spec(),
+            joined.spec(),
             expected,
             "Joined spec should match expected spec.",
         );
@@ -1614,7 +2212,7 @@ mod test {
         let split = joined.relative_to(&base_builder).unwrap();
 
         assert_eq!(
-            split.get_spec(),
+            split.spec(),
             after_split,
             "Split spec should match expected.",
         );

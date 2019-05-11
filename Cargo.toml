@@ -1,5 +1,5 @@
 [package]
-name = "uriparser"
+name = "urlbuilder"
 version = "0.1.0"
 authors = ["Dave Townsend <dtownsend@oxymoronical.com>"]
 edition = "2018"
