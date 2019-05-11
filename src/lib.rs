@@ -1978,7 +1978,7 @@ mod test {
             "Parsed spec should match expected."
         );
         let reparsed = builder.spec().parse::<UrlBuilder>().unwrap();
-        assert_eq!(builder, reparsed, "Reparsed builder should match original.");
+        assert_eq!(reparsed, builder, "Reparsed builder should match original.");
         builder
     }
 
