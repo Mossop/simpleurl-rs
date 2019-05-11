@@ -62,7 +62,6 @@
 #![deny(unused_variables)]
 
 use regex::Regex;
-use std::borrow::Borrow;
 use std::convert::{TryFrom, TryInto};
 use std::error;
 use std::fmt;
