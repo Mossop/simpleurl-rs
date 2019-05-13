@@ -229,13 +229,18 @@ impl fmt::Display for Scheme {
     }
 }
 
-/// Holds the username, password, hostname and port of the URL.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Authentication {
+    username: String,
+    password: String,
+}
+
+/// Holds the authentication, hostname and port of the URL.
 ///
 /// There is always a hostname, the other fields are optional.
 #[derive(Debug, Clone, PartialEq, Default)]
 struct Host {
-    username: Option<String>,
-    password: Option<String>,
+    authentication: Option<Authentication>,
     hostname: String,
     port: Option<u32>,
 }
@@ -252,13 +257,11 @@ impl Host {
 
 impl fmt::Display for Host {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        if self.username.is_some() || self.password.is_some() {
-            if let Some(ref u) = self.username {
-                f.write_str(&percent_encode(&u))?;
-            }
+        if let Some(auth) = &self.authentication {
+            f.write_str(&percent_encode(&auth.username))?;
 
-            if let Some(ref p) = self.password {
-                f.write_fmt(format_args!(":{}", &percent_encode(&p)))?;
+            if !auth.password.is_empty() {
+                f.write_fmt(format_args!(":{}", &percent_encode(&auth.password)))?;
             }
 
             f.write_str("@")?;
@@ -546,9 +549,23 @@ fn parse_host(spec: &str, start_pos: &mut usize, end_pos: &mut usize) -> UrlResu
     match re.captures(search) {
         Some(captures) => {
             *start_pos += captures[0].len();
+
             Ok(Some(Host {
-                username: map_match_to_string(captures.get(1), spec),
-                password: map_match_to_string(captures.get(2), spec),
+                authentication: match (captures.get(1), captures.get(2)) {
+                    (Some(um), Some(pm)) => Some(Authentication {
+                        username: um.as_str().to_owned(),
+                        password: pm.as_str().to_owned(),
+                    }),
+                    (Some(um), None) => Some(Authentication {
+                        username: um.as_str().to_owned(),
+                        password: String::new(),
+                    }),
+                    (None, Some(pm)) => Some(Authentication {
+                        username: String::new(),
+                        password: pm.as_str().to_owned(),
+                    }),
+                    (None, None) => None,
+                },
                 hostname: captures[3].to_owned(),
                 port: map_match_to_u32(captures.get(4), spec)?,
             }))
@@ -974,7 +991,10 @@ impl UrlBuilder {
 
     /// Gets the builder's username.
     pub fn username(&self) -> Option<String> {
-        self.host.as_ref().and_then(|h| h.username.clone())
+        self.host
+            .as_ref()
+            .and_then(|h| h.authentication.as_ref())
+            .and_then(|a| Some(a.username.clone()))
     }
 
     /// Sets the builder's username.
@@ -994,8 +1014,24 @@ impl UrlBuilder {
                         &self.spec(),
                     ))
                 } else {
-                    h.username = username.map(ToOwned::to_owned);
-                    Ok(())
+                    match (&mut h.authentication, username) {
+                        (Some(auth), Some(u)) => {
+                            auth.username = u.to_owned();
+                            Ok(())
+                        }
+                        (Some(_), None) => {
+                            h.authentication = None;
+                            Ok(())
+                        }
+                        (None, Some(u)) => {
+                            h.authentication = Some(Authentication {
+                                username: u.to_owned(),
+                                password: String::new(),
+                            });
+                            Ok(())
+                        }
+                        (None, None) => Ok(()),
+                    }
                 }
             }
             None => {
@@ -1011,7 +1047,10 @@ impl UrlBuilder {
 
     /// Gets the builder's password.
     pub fn password(&self) -> Option<String> {
-        self.host.as_ref().and_then(|h| h.password.clone())
+        self.host
+            .as_ref()
+            .and_then(|h| h.authentication.as_ref())
+            .and_then(|a| Some(a.password.clone()))
     }
 
     /// Sets the builder's password.
@@ -1031,12 +1070,28 @@ impl UrlBuilder {
                         &self.spec(),
                     ))
                 } else {
-                    h.password = password.map(ToOwned::to_owned);
-                    Ok(())
+                    match (&mut h.authentication, password) {
+                        (Some(auth), Some(p)) => {
+                            auth.password = p.to_owned();
+                            Ok(())
+                        }
+                        (Some(_), None) => {
+                            h.authentication = None;
+                            Ok(())
+                        }
+                        (None, Some(p)) => {
+                            h.authentication = Some(Authentication {
+                                username: String::new(),
+                                password: p.to_owned(),
+                            });
+                            Ok(())
+                        }
+                        (None, None) => Ok(()),
+                    }
                 }
             }
             None => {
-                // username must contain Some at this point or the bailout above
+                // password must contain Some at this point or the bailout above
                 // would have triggered.
                 Err(UrlError::new(
                     "Cannot set a password on a url with no hostname",
@@ -1060,8 +1115,7 @@ impl UrlBuilder {
             Some(h) => {
                 if h.is_empty() || self.host.is_none() {
                     self.host = Some(Host {
-                        username: None,
-                        password: None,
+                        authentication: None,
                         hostname: h.to_owned(),
                         port: None,
                     });
@@ -1999,8 +2053,10 @@ mod test {
             UrlBuilder {
                 scheme: Some(Scheme::Special(String::from("http"))),
                 host: Some(Host {
-                    username: Some(String::from("foo")),
-                    password: Some(String::from("bar")),
+                    authentication: Some(Authentication {
+                        username: String::from("foo"),
+                        password: String::from("bar"),
+                    }),
                     hostname: String::from("www.example.com"),
                     port: Some(24),
                 }),
@@ -2022,8 +2078,10 @@ mod test {
             UrlBuilder {
                 scheme: Some(Scheme::Special(String::from("https"))),
                 host: Some(Host {
-                    username: Some(String::from("hello")),
-                    password: None,
+                    authentication: Some(Authentication {
+                        username: String::from("hello"),
+                        password: String::new(),
+                    }),
                     hostname: String::from("foo"),
                     port: None,
                 }),
@@ -2045,8 +2103,7 @@ mod test {
             UrlBuilder {
                 scheme: Some(Scheme::File),
                 host: Some(Host {
-                    username: None,
-                    password: None,
+                    authentication: None,
                     hostname: String::new(),
                     port: None,
                 }),
@@ -2071,8 +2128,7 @@ mod test {
             UrlBuilder {
                 scheme: None,
                 host: Some(Host {
-                    username: None,
-                    password: None,
+                    authentication: None,
                     hostname: String::from("www"),
                     port: None,
                 }),
@@ -2151,8 +2207,7 @@ mod test {
             UrlBuilder {
                 scheme: Some(Scheme::File),
                 host: Some(Host {
-                    username: None,
-                    password: None,
+                    authentication: None,
                     hostname: String::from("foo"),
                     port: None,
                 }),
