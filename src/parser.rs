@@ -1,6 +1,5 @@
 #![warn(missing_docs)]
 #![deny(unused_variables)]
-#![allow(dead_code)]
 
 use super::{Authentication, Host, Path, Scheme, UrlBuilder, UrlError, UrlResult};
 use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
@@ -75,14 +74,6 @@ impl CodepointRange {
         CodepointSet {
             included: vec![self.clone()],
             excluded: Default::default(),
-        }
-    }
-
-    /// Converts this to a `CodepointSet` that excludes this range.
-    fn as_excluded_set(&self) -> CodepointSet {
-        CodepointSet {
-            included: Default::default(),
-            excluded: vec![self.clone()],
         }
     }
 }
@@ -230,16 +221,6 @@ impl CodepointSet {
 
         false
     }
-
-    fn matches_all(&self, test: &str) -> bool {
-        for ch in test.chars() {
-            if !self.includes(ch) {
-                return false;
-            }
-        }
-
-        true
-    }
 }
 
 impl Add<CodepointRange> for CodepointSet {
@@ -282,24 +263,6 @@ impl Neg for CodepointSet {
             included: self.excluded,
             excluded: self.included,
         }
-    }
-}
-
-struct PathIterator<'a> {
-    parser: &'a mut UrlParser<'a>,
-}
-
-impl<'a> PathIterator<'a> {
-    fn new(parser: &'a mut UrlParser<'a>) -> PathIterator<'a> {
-        PathIterator { parser }
-    }
-}
-
-impl<'a> Iterator for PathIterator<'a> {
-    type Item = String;
-
-    fn next(&mut self) -> Option<String> {
-        None
     }
 }
 
@@ -849,14 +812,8 @@ mod test {
         let set = CodepointRange::from_codepoint('b').as_included_set();
         verify_codepoint_set(&set, vec!['b'], vec!['a', 'c']);
 
-        let set = CodepointRange::from_codepoint('b').as_excluded_set();
-        verify_codepoint_set(&set, vec!['a', 'c'], vec!['b']);
-
         let set = CodepointRange::from_range('b', 'd').as_included_set();
         verify_codepoint_set(&set, vec!['b', 'c', 'd'], vec!['a', 'e']);
-
-        let set = CodepointRange::from_range('b', 'd').as_excluded_set();
-        verify_codepoint_set(&set, vec!['a', 'e'], vec!['b', 'c', 'd']);
 
         let set = CodepointSet::from_included_set("A-Gb-cz");
         verify_codepoint_set(
