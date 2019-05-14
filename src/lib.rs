@@ -61,42 +61,14 @@
 #![warn(missing_docs)]
 #![deny(unused_variables)]
 
-use regex::Regex;
+mod parser;
+
+use parser::{percent_decode, percent_encode};
 use std::convert::{TryFrom, TryInto};
 use std::error;
 use std::fmt;
 use std::str::FromStr;
 use std::string::ToString;
-
-/// These code points are not allowed anywhere in a uri string.
-const C0_CONTROL: &str = "\u{0000}-\u{001F}";
-/// These are the allowable code points in most parts of a uri string.
-const URL_CODE_POINTS: &str =
-    "0-9A-Za-z!$&'()*+,-\\./:;=?@_~\u{00A0}-\u{D7FF}\u{E000}-\u{10FFFD}--\
-     [\u{FDD0}-\u{FDEF}\u{FFFE}\u{FFFF}\u{1FFFE}\u{1FFFF}\u{2FFFE}\u{2FFFF}\
-     \u{3FFFE}\u{3FFFF}\u{4FFFE}\u{4FFFF}\u{5FFFE}\u{5FFFF}\u{6FFFE}\u{6FFFF}\
-     \u{7FFFE}\u{7FFFF}\u{8FFFE}\u{8FFFF}\u{9FFFE}\u{9FFFF}\u{AFFFE}\u{AFFFF}\
-     \u{BFFFE}\u{BFFFF}\u{CFFFE}\u{CFFFF}\u{DFFFE}\u{DFFFF}\u{EFFFE}\u{EFFFF}\
-     \u{FFFFE}\u{FFFFF}\u{10FFFE}\u{10FFFF}]\
-     ";
-/// Matches a percent encoded code point.
-const PERCENT_ENCODED_BYTE: &str = "%[0-9a-fA-F]{2}";
-
-/// Responsible for percent decoding a string.
-///
-/// The result contains all the characters from the original with percent
-/// encoded bytes converted back to their original representation.
-pub fn percent_decode(data: &str) -> String {
-    String::from(data)
-}
-
-/// Responsible for percent encoding a string.
-///
-/// The result contains all the characters from the original with illegal
-/// characters percent encoded.
-pub fn percent_encode(data: &str) -> String {
-    String::from(data)
-}
 
 /// Represents an error that occurred while parsing or manipulating a URI.
 ///
@@ -129,26 +101,6 @@ impl error::Error for UrlError {}
 
 /// A specialized result where the error is always a [`UrlError`](struct.UrlError.html).
 pub type UrlResult<T> = Result<T, UrlError>;
-
-/// A simple wrapper around generating a regular expression.
-fn regex(r: &str) -> UrlResult<Regex> {
-    match Regex::new(r) {
-        Ok(result) => Ok(result),
-        Err(err) => Err(match err {
-            regex::Error::Syntax(_) => UrlError::new(
-                "Syntax error in regular expression. Please report a bug.",
-                r,
-            ),
-            regex::Error::CompiledTooBig(_) => {
-                UrlError::new("Regular expressions was too large. Please report a bug.", r)
-            }
-            _ => UrlError::new(
-                "Unexpected regular expression error. Please report a bug.",
-                r,
-            ),
-        }),
-    }
-}
 
 /// The default ports for the non-file special schemes.
 const SPECIAL_SCHEMES: [(&str, u32); 6] = [
@@ -484,158 +436,6 @@ impl fmt::Display for UrlSearchParams {
     }
 }
 
-/// Parses a scheme out of the current spec.
-fn parse_scheme(
-    spec: &str,
-    start_pos: &mut usize,
-    end_pos: &mut usize,
-) -> UrlResult<Option<Scheme>> {
-    if end_pos < start_pos {
-        return Err(UrlError::new("Parse failure (end < start).", spec));
-    }
-
-    let search = &spec[*start_pos..*end_pos];
-    let re = regex("[a-zA-Z][a-zA-Z0-9+-\\.]*:")?;
-
-    let scheme_match = match re.find(search) {
-        Some(m) => m,
-        None => return Ok(None),
-    };
-
-    if scheme_match.start() >= scheme_match.end() {
-        return Err(UrlError::new("Invalid scheme.", spec));
-    }
-
-    let scheme = &search[scheme_match.start()..scheme_match.end() - 1];
-    *start_pos += scheme_match.end();
-    Ok(Some(Scheme::from_str(scheme)?))
-}
-
-/// Helper to convert a `Option<Match>` to a `Option<String>`.
-fn map_match_to_string(option: Option<regex::Match>, _spec: &str) -> Option<String> {
-    option.map(|m| m.as_str().to_owned())
-}
-
-/// Helper to convert a `Option<Match>` to a `Option<u32>` or an error if the
-/// text could not be converted to a `u32`.
-fn map_match_to_u32(option: Option<regex::Match>, spec: &str) -> UrlResult<Option<u32>> {
-    match option {
-        Some(m) => match m.as_str().parse::<u32>() {
-            Ok(p) => Ok(Some(p)),
-            _ => Err(UrlError::new("Unable to parse port number", spec)),
-        },
-        None => Ok(None),
-    }
-}
-
-/// Parses a host out of the current spec.
-fn parse_host(spec: &str, start_pos: &mut usize, end_pos: &mut usize) -> UrlResult<Option<Host>> {
-    if end_pos < start_pos {
-        return Err(UrlError::new("Parse failure (end < start).", spec));
-    }
-
-    if (*end_pos - *start_pos) < 3 || &spec[*start_pos..*start_pos + 2] != "//" {
-        return Ok(None);
-    }
-
-    *start_pos += 2;
-
-    let search = &spec[*start_pos..*end_pos];
-    let re = regex(&format!(
-        "^(?:([{0}--[@:/]]*)(?::([{0}--[@:/]]*))?@)?([{}--[/:]]+)(?::(\\d+))?",
-        URL_CODE_POINTS
-    ))?;
-
-    match re.captures(search) {
-        Some(captures) => {
-            *start_pos += captures[0].len();
-
-            Ok(Some(Host {
-                authentication: match (captures.get(1), captures.get(2)) {
-                    (Some(um), Some(pm)) => Some(Authentication {
-                        username: um.as_str().to_owned(),
-                        password: pm.as_str().to_owned(),
-                    }),
-                    (Some(um), None) => Some(Authentication {
-                        username: um.as_str().to_owned(),
-                        password: String::new(),
-                    }),
-                    (None, Some(pm)) => Some(Authentication {
-                        username: String::new(),
-                        password: pm.as_str().to_owned(),
-                    }),
-                    (None, None) => None,
-                },
-                hostname: captures[3].to_owned(),
-                port: map_match_to_u32(captures.get(4), spec)?,
-            }))
-        }
-        None => Ok(Some(Default::default())),
-    }
-}
-
-/// Parses a path out of the current spec.
-fn parse_path(spec: &str, start_pos: &mut usize, end_pos: &mut usize) -> UrlResult<Path> {
-    if end_pos < start_pos {
-        return Err(UrlError::new("Parse failure (end < start).", spec));
-    }
-
-    let search = &spec[*start_pos..*end_pos];
-    *start_pos = *end_pos;
-
-    Ok(Path::from(search))
-}
-
-/// Parses a query string out of the current spec.
-fn parse_query(
-    spec: &str,
-    start_pos: &mut usize,
-    end_pos: &mut usize,
-) -> UrlResult<Option<String>> {
-    if end_pos < start_pos {
-        return Err(UrlError::new("Parse failure (end < start).", spec));
-    }
-
-    let search = &spec[*start_pos..*end_pos];
-    let re = regex(&format!(
-        "\\?(?:[{}]|[{}])*$",
-        URL_CODE_POINTS, PERCENT_ENCODED_BYTE
-    ))?;
-
-    let frag_match = match re.find(search) {
-        Some(m) => m,
-        None => return Ok(None),
-    };
-
-    *end_pos = frag_match.start();
-    Ok(Some(frag_match.as_str()[1..].to_owned()))
-}
-
-/// Parses a fragment out of the current spec.
-fn parse_fragment(
-    spec: &str,
-    start_pos: &mut usize,
-    end_pos: &mut usize,
-) -> UrlResult<Option<String>> {
-    if end_pos < start_pos {
-        return Err(UrlError::new("Parse failure (end < start).", spec));
-    }
-
-    let search = &spec[*start_pos..*end_pos];
-    let re = regex(&format!(
-        "#(?:[{}]|[{}])*$",
-        URL_CODE_POINTS, PERCENT_ENCODED_BYTE
-    ))?;
-
-    let frag_match = match re.find(search) {
-        Some(m) => m,
-        None => return Ok(None),
-    };
-
-    *end_pos = frag_match.start();
-    Ok(Some(percent_decode(&frag_match.as_str()[1..])))
-}
-
 /// Low-level support for building and manipulating URLs.
 ///
 /// The `UrlBuilder`is used by both [`Url`] and [`RelativeUrl`] to handle
@@ -717,49 +517,8 @@ impl UrlBuilder {
     /// # }
     /// ```
     pub fn from_spec(spec: &str) -> UrlResult<Self> {
-        let mut builder: UrlBuilder = Default::default();
-
-        let c0_re = regex(&format!("^[{0} ]|[{0} ]$", C0_CONTROL))?;
-        if c0_re.is_match(spec) {
-            return Err(UrlError::new(
-                "Url starts or ends with an invalid character.",
-                spec,
-            ));
-        }
-
-        let ws_re = regex("[\t\n]")?;
-        if ws_re.is_match(spec) {
-            return Err(UrlError::new(
-                "Url contains an invalid whitespace character.",
-                spec,
-            ));
-        }
-
-        let mut start_pos = 0;
-        let mut end_pos = spec.len();
-
-        // First parse out the optional end bits.
-        builder.fragment = parse_fragment(spec, &mut start_pos, &mut end_pos)?;
-        builder.query = parse_query(spec, &mut start_pos, &mut end_pos)?;
-
-        // Parse out scheme bits.
-        builder.scheme = parse_scheme(spec, &mut start_pos, &mut end_pos)?;
-
-        builder.host = parse_host(spec, &mut start_pos, &mut end_pos)?;
-
-        builder.path = if start_pos == end_pos {
-            if builder.host.is_some() {
-                Path::from("/")
-            } else {
-                Default::default()
-            }
-        } else {
-            parse_path(spec, &mut start_pos, &mut end_pos)?
-        };
-
-        assert_eq!(start_pos, end_pos);
-
-        Ok(builder)
+        let parse_result = parser::UrlParser::parse(spec)?;
+        Ok(parse_result.builder)
     }
 
     /// Normalises the path component of the URL.
@@ -2218,11 +1977,11 @@ mod test {
         );
     }
 
-    fn check_normalize(spec: &str, expected: &str) {
-        let mut builder: UrlBuilder = spec.parse().unwrap();
-        builder.normalize();
+    fn check_normalize(test: &str, expected: &str) {
+        let mut path = Path::from(test);
+        path.normalize();
         assert_eq!(
-            builder.spec(),
+            path.to_string(),
             expected,
             "Normalized spec should have matched expected."
         );
@@ -2230,18 +1989,9 @@ mod test {
 
     #[test]
     fn builder_path_normalize() {
-        check_normalize(
-            "https://www.google.com/foo/.././bar/",
-            "https://www.google.com/bar/",
-        );
-        check_normalize(
-            "https://www.google.com/foo/../bar",
-            "https://www.google.com/bar",
-        );
-        check_normalize(
-            "https://www.google.com/../bar/",
-            "https://www.google.com/bar/",
-        );
+        check_normalize("/foo/.././bar/", "/bar/");
+        check_normalize("/foo/../bar", "/bar");
+        check_normalize("/../bar/", "/bar/");
         check_normalize("foo/.././bar/", "bar/");
         check_normalize("foo/../bar", "bar");
         check_normalize("../bar/", "../bar/");
