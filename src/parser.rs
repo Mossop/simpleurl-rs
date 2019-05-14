@@ -381,9 +381,6 @@ impl<'a> UrlParser<'a> {
         }
 
         parser.parse_scheme()?;
-        if parser.chars.is_empty() {
-            return Ok(parser.result);
-        }
 
         if parser.result.builder.scheme == Some(Scheme::File) {
             parser.parse_file_host()?;
@@ -480,46 +477,45 @@ impl<'a> UrlParser<'a> {
     }
 
     fn parse_host(&mut self) -> UrlResult<()> {
-        // Here we are just after after the `:` of the scheme, chars is non-empty.
+        // Here we are just after after the `:` of the scheme, chars may be empty.
 
         let count = self.find_forwards(&CodepointSet::from_excluded_set("\\\\/"));
 
         // special schemes are allowed fewer that two slashes.
-        let is_special = if let Some(ref s) = self.result.builder.scheme {
-            if let Scheme::Special(_) = s {
-                true
-            } else {
-                false
+        if let Some(ref s) = self.result.builder.scheme {
+            if let Scheme::NotSpecial(_) = s {
+                if count < 2 {
+                    // Let's assume this is a path?
+                    return Ok(());
+                }
             }
-        } else {
-            false
-        };
-
-        if count < 2 && !is_special {
-            // No host at all.
+        } else if count < 2 {
+            // With no scheme we might be dealing with an absolute or relative
+            // URL.
             return Ok(());
         }
 
         if count != 2
-            || self.find_forwards(&CodepointRange::from_codepoint('\\').as_included_set()) <= count
-                && count < self.chars.len()
+            || (self.find_forwards(&CodepointRange::from_codepoint('\\').as_included_set())
+                <= count
+                && count < self.chars.len())
         {
             self.result.is_valid = false;
         }
 
-        if count > 2 {
-            self.result.is_valid = false;
-        }
-
         self.move_start(count)?;
-        let mut host: Host = Default::default();
 
         // authority state
 
         let mut end_pos = self.find_forwards(&CodepointSet::from_included_set("\\\\/?#"));
         if end_pos == 0 {
-            return Err(self.error("Expected a non-empty host"));
+            if let Some(Scheme::Special(_)) = self.result.builder.scheme {
+                return Err(self.error("Special URLs require a non-empty hostname."));
+            }
+            return Ok(());
         }
+
+        let mut host: Host = Default::default();
 
         let at_pos = self.find_forwards(&CodepointRange::from_codepoint('@').as_included_set());
 
@@ -600,11 +596,18 @@ impl<'a> UrlParser<'a> {
     }
 
     fn parse_file_host(&mut self) -> UrlResult<()> {
-        // Here we are just after the `:` of the scheme, chars is non-empty.
+        // Here we are just after the `:` of the scheme, chars may be empty.
 
         // file state
 
+        // file scheme URLs always have an empty hostname if not otherwise
+        // defined.
         self.result.builder.host = Some(Default::default());
+
+        if self.chars.is_empty() {
+            self.result.is_valid = false;
+            return Ok(());
+        }
 
         if self.chars[0] == '/' {
             self.move_start(1)?;
@@ -612,12 +615,14 @@ impl<'a> UrlParser<'a> {
             self.result.is_valid = false;
             self.move_start(1)?;
         } else {
+            self.result.is_valid = false;
             return Ok(());
         }
 
         // file slash state
 
         if self.chars.is_empty() {
+            self.result.is_valid = false;
             return Ok(());
         }
 
@@ -627,6 +632,7 @@ impl<'a> UrlParser<'a> {
             self.result.is_valid = false;
             self.move_start(1)?;
         } else {
+            self.result.is_valid = false;
             return Ok(());
         }
 
@@ -667,7 +673,7 @@ impl<'a> UrlParser<'a> {
         if self.chars.is_empty() || endings.includes(self.chars[0]) {
             // If we have a host then we always have an absolute path.
             if is_absolute {
-                self.result.builder.path = Path::from("/");
+                self.result.builder.path.components = vec![String::new(), String::new()];
             }
             return Ok(());
         }
@@ -862,7 +868,7 @@ mod test {
                     hostname: String::from("www.google.com"),
                     port: None,
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -879,7 +885,7 @@ mod test {
                     hostname: String::from("www.google.com"),
                     port: None,
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -921,7 +927,7 @@ mod test {
             UrlBuilder {
                 scheme: None,
                 host: None,
-                path: Path::from("noscheme"),
+                path: Path::from_components(vec!["noscheme"]),
                 query: None,
                 fragment: None,
             }
@@ -934,7 +940,7 @@ mod test {
             UrlBuilder {
                 scheme: None,
                 host: None,
-                path: Path::from("1badscheme:"),
+                path: Path::from_components(vec!["1badscheme:"]),
                 query: None,
                 fragment: None,
             }
@@ -947,7 +953,7 @@ mod test {
             UrlBuilder {
                 scheme: None,
                 host: None,
-                path: Path::from("bad>scheme:"),
+                path: Path::from_components(vec!["bad>scheme:"]),
                 query: None,
                 fragment: None,
             }
@@ -967,13 +973,68 @@ mod test {
                     hostname: String::from("host"),
                     port: None
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
         );
 
-        assert!(UrlParser::parse("scheme://").is_err());
+        let result = UrlParser::parse("scheme://").unwrap();
+        assert!(result.is_valid);
+        assert_eq!(
+            result.builder,
+            UrlBuilder {
+                scheme: Some(Scheme::NotSpecial(String::from("scheme"))),
+                host: None,
+                path: Default::default(),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let result = UrlParser::parse("scheme:/").unwrap();
+        assert!(result.is_valid);
+        assert_eq!(
+            result.builder,
+            UrlBuilder {
+                scheme: Some(Scheme::NotSpecial(String::from("scheme"))),
+                host: None,
+                path: Path::root_path(),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let result = UrlParser::parse("scheme:/foo").unwrap();
+        assert!(result.is_valid);
+        assert_eq!(
+            result.builder,
+            UrlBuilder {
+                scheme: Some(Scheme::NotSpecial(String::from("scheme"))),
+                host: None,
+                path: Path::from_components(vec!["", "foo"]),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let result = UrlParser::parse("scheme:foo").unwrap();
+        assert!(result.is_valid);
+        assert_eq!(
+            result.builder,
+            UrlBuilder {
+                scheme: Some(Scheme::NotSpecial(String::from("scheme"))),
+                host: None,
+                path: Path::from_components(vec!["foo"]),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        assert!(UrlParser::parse("http:///").is_err());
+        assert!(UrlParser::parse("http://").is_err());
+        assert!(UrlParser::parse("http:/").is_err());
+        assert!(UrlParser::parse("http:").is_err());
 
         let result = UrlParser::parse("scheme:////host").unwrap();
         assert!(!result.is_valid);
@@ -986,7 +1047,7 @@ mod test {
                     hostname: String::from("host"),
                     port: None
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1003,7 +1064,7 @@ mod test {
                     hostname: String::from("host"),
                     port: None
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1020,7 +1081,7 @@ mod test {
                     hostname: String::from("host"),
                     port: None
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1040,7 +1101,7 @@ mod test {
                     hostname: String::from("host"),
                     port: None
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1060,7 +1121,7 @@ mod test {
                     hostname: String::from("host"),
                     port: None
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1080,7 +1141,7 @@ mod test {
                     hostname: String::from("host"),
                     port: None
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1103,7 +1164,7 @@ mod test {
                     hostname: String::from("host"),
                     port: Some(59),
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1120,7 +1181,7 @@ mod test {
                     hostname: String::from("host"),
                     port: None
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1137,7 +1198,24 @@ mod test {
                     hostname: String::from("host"),
                     port: None
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let result = UrlParser::parse("file:////").unwrap();
+        assert!(result.is_valid);
+        assert_eq!(
+            result.builder,
+            UrlBuilder {
+                scheme: Some(Scheme::File),
+                host: Some(Host {
+                    authentication: None,
+                    hostname: String::new(),
+                    port: None,
+                }),
+                path: Path::from_components(vec!["", "", ""]),
                 query: None,
                 fragment: None,
             }
@@ -1154,7 +1232,7 @@ mod test {
                     hostname: String::new(),
                     port: None,
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1171,7 +1249,24 @@ mod test {
                     hostname: String::new(),
                     port: None,
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let result = UrlParser::parse("file:/").unwrap();
+        assert!(!result.is_valid);
+        assert_eq!(
+            result.builder,
+            UrlBuilder {
+                scheme: Some(Scheme::File),
+                host: Some(Host {
+                    authentication: None,
+                    hostname: String::new(),
+                    port: None,
+                }),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1188,7 +1283,7 @@ mod test {
                     hostname: String::new(),
                     port: None,
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1205,7 +1300,7 @@ mod test {
                     hostname: String::new(),
                     port: None,
                 }),
-                path: Path::from("/c:/"),
+                path: Path::from_components(vec!["", "c:", ""]),
                 query: None,
                 fragment: None,
             }
@@ -1225,7 +1320,7 @@ mod test {
                     hostname: String::new(),
                     port: None,
                 }),
-                path: Path::from("/c:/"),
+                path: Path::from_components(vec!["", "c:", ""]),
                 query: None,
                 fragment: None,
             }
@@ -1242,7 +1337,7 @@ mod test {
                     hostname: String::new(),
                     port: None,
                 }),
-                path: Path::from("/c:/"),
+                path: Path::from_components(vec!["", "c:", ""]),
                 query: None,
                 fragment: None,
             }
@@ -1259,7 +1354,7 @@ mod test {
                     hostname: String::new(),
                     port: None,
                 }),
-                path: Path::from("/foo/c|/"),
+                path: Path::from_components(vec!["", "foo", "c|", ""]),
                 query: None,
                 fragment: None,
             }
@@ -1276,7 +1371,7 @@ mod test {
                     hostname: String::from("host"),
                     port: None,
                 }),
-                path: Path::from("/foo/bar"),
+                path: Path::from_components(vec!["", "foo", "bar"]),
                 query: None,
                 fragment: None,
             }
@@ -1293,7 +1388,7 @@ mod test {
                     hostname: String::from("host"),
                     port: None,
                 }),
-                path: Path::from("/foo/bar/"),
+                path: Path::from_components(vec!["", "foo", "bar", ""]),
                 query: None,
                 fragment: None,
             }
@@ -1310,7 +1405,7 @@ mod test {
                     hostname: String::from("host"),
                     port: None,
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1327,7 +1422,7 @@ mod test {
                     hostname: String::from("host"),
                     port: None,
                 }),
-                path: Path::from("/bar/"),
+                path: Path::from_components(vec!["", "bar", ""]),
                 query: None,
                 fragment: None,
             }
@@ -1340,7 +1435,7 @@ mod test {
             UrlBuilder {
                 scheme: None,
                 host: None,
-                path: Path::from("/foo/bar"),
+                path: Path::from_components(vec!["", "foo", "bar"]),
                 query: None,
                 fragment: None,
             }
@@ -1353,7 +1448,7 @@ mod test {
             UrlBuilder {
                 scheme: None,
                 host: None,
-                path: Path::from("/foo/bar/"),
+                path: Path::from_components(vec!["", "foo", "bar", ""]),
                 query: None,
                 fragment: None,
             }
@@ -1366,7 +1461,7 @@ mod test {
             UrlBuilder {
                 scheme: None,
                 host: None,
-                path: Path::from("/bar/"),
+                path: Path::from_components(vec!["", "bar", ""]),
                 query: None,
                 fragment: None,
             }
@@ -1399,7 +1494,7 @@ mod test {
                     hostname: String::from("www"),
                     port: None,
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: Some(String::from("foobarhello")),
                 fragment: None,
             }
@@ -1432,7 +1527,7 @@ mod test {
                     hostname: String::from("www"),
                     port: None,
                 }),
-                path: Path::from("/"),
+                path: Path::root_path(),
                 query: None,
                 fragment: Some(String::from("foobarhello")),
             }
@@ -1517,7 +1612,8 @@ mod test {
             "https://example.com/example",
         );
 
-        // Test seems wrong?
+        // Test seems wrong? Expected is meant to be `file:///C:/`. Firefox
+        // disagrees.
         parse_valid("..", "file:///C:/demo", "file:///");
 
         // Needs percent decoding to work.

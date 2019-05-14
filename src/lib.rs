@@ -288,7 +288,7 @@ struct Path {
 
 impl Path {
     /// Converts a full path to a `Path`.
-    pub fn from(path: &str) -> Self {
+    pub fn from_str(path: &str) -> Self {
         if path.is_empty() {
             Default::default()
         } else {
@@ -296,6 +296,16 @@ impl Path {
                 components: path.split('/').map(|p| percent_decode(p)).collect(),
             }
         }
+    }
+
+    pub fn from_components(components: Vec<&str>) -> Path {
+        Path {
+            components: components.iter().map(|p| String::from(*p)).collect(),
+        }
+    }
+
+    pub fn root_path() -> Path {
+        Path::from_components(vec!["", ""])
     }
 
     /// Normalizes the path components.
@@ -469,12 +479,12 @@ impl fmt::Display for UrlSearchParams {
 /// builder.set_scheme(Some("http"))?;
 /// assert_eq!(builder.spec(), "http:");
 /// assert!(!builder.is_absolute_url());
-/// assert!(!builder.is_relative_url());
+/// assert!(builder.is_relative_url());
 ///
 /// builder.set_path("/foo/bar")?;
 /// assert_eq!(builder.spec(), "http:/foo/bar");
 /// assert!(!builder.is_absolute_url());
-/// assert!(!builder.is_relative_url());
+/// assert!(builder.is_relative_url());
 ///
 /// builder.set_hostname(Some("www.google.com"))?;
 /// assert!(builder.is_absolute_url());
@@ -597,15 +607,11 @@ impl UrlBuilder {
     /// Tests whether this builder contains components that can make a relative
     /// URL.
     pub fn is_relative_url(&self) -> bool {
-        if self.scheme.is_some() {
-            return false;
+        if self.scheme.is_none() || self.host.is_none() || !self.path.is_absolute() {
+            return true;
         }
 
-        if self.host.is_some() && !self.path.is_absolute() {
-            return false;
-        }
-
-        true
+        false
     }
 
     /// Tests whether this builder contains a path that can be considered to
@@ -960,7 +966,7 @@ impl UrlBuilder {
 
     /// Sets the builder's path.
     pub fn set_path(&mut self, path: &str) -> UrlResult<()> {
-        self.path = Path::from(path);
+        self.path = Path::from_str(path);
         Ok(())
     }
 
@@ -1110,7 +1116,7 @@ impl UrlBuilder {
     }
 
     fn set_url_pathname(&mut self, path: &str) -> UrlResult<()> {
-        self.path = Path::from(path);
+        self.path = Path::from_str(path);
         Ok(())
     }
 
@@ -1778,13 +1784,8 @@ impl fmt::Display for RelativeUrl {
 
 #[cfg(test)]
 mod test {
+    #![allow(clippy::cyclomatic_complexity)]
     use super::*;
-
-    fn build_path(parts: Vec<&str>) -> Path {
-        Path {
-            components: parts.iter().map(|p| String::from(*p)).collect(),
-        }
-    }
 
     fn builder_parse_change(spec: &str, expected: &str) -> UrlBuilder {
         let builder = spec.parse::<UrlBuilder>().unwrap();
@@ -1823,7 +1824,7 @@ mod test {
                     hostname: String::from("www.example.com"),
                     port: Some(24),
                 }),
-                path: build_path(vec!["", "foo", "bar"]),
+                path: Path::from_components(vec!["", "foo", "bar"]),
                 query: Some(String::from("zed")),
                 fragment: Some(String::from("frag")),
             },
@@ -1848,7 +1849,7 @@ mod test {
                     hostname: String::from("foo"),
                     port: None,
                 }),
-                path: build_path(vec!["", ""]),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1870,7 +1871,25 @@ mod test {
                     hostname: String::new(),
                     port: None,
                 }),
-                path: build_path(vec!["", "foo", "bar"]),
+                path: Path::from_components(vec!["", "foo", "bar"]),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let builder = builder_parse_change("file:", "file:///");
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
+        assert!(!builder.path.is_empty());
+        assert!(builder.path.is_absolute());
+        assert!(builder.path.is_directory());
+
+        assert_eq!(
+            builder,
+            UrlBuilder {
+                scheme: Some(Scheme::File),
+                host: Some(Default::default()),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
@@ -1895,7 +1914,7 @@ mod test {
                     hostname: String::from("www"),
                     port: None,
                 }),
-                path: build_path(vec!["", "example"]),
+                path: Path::from_components(vec!["", "example"]),
                 query: None,
                 fragment: None,
             }
@@ -1913,7 +1932,7 @@ mod test {
             UrlBuilder {
                 scheme: None,
                 host: None,
-                path: build_path(vec!["", "www", "example"]),
+                path: Path::from_components(vec!["", "www", "example"]),
                 query: None,
                 fragment: None,
             }
@@ -1931,7 +1950,7 @@ mod test {
             UrlBuilder {
                 scheme: None,
                 host: None,
-                path: build_path(vec!["www", "example", ""]),
+                path: Path::from_components(vec!["www", "example", ""]),
                 query: None,
                 fragment: None,
             }
@@ -1940,24 +1959,6 @@ mod test {
 
     #[test]
     fn builder_parse_bad_urls() {
-        let builder = builder_parse("file:");
-        assert!(!builder.is_absolute_url());
-        assert!(!builder.is_relative_url());
-        assert!(builder.path.is_empty());
-        assert!(builder.path.is_relative());
-        assert!(!builder.path.is_directory());
-
-        assert_eq!(
-            builder,
-            UrlBuilder {
-                scheme: Some(Scheme::File),
-                host: None,
-                path: Default::default(),
-                query: None,
-                fragment: None,
-            }
-        );
-
         let builder = builder_parse("file://foo/bar/");
         assert!(!builder.is_absolute_url());
         assert!(!builder.is_relative_url());
@@ -1974,7 +1975,7 @@ mod test {
                     hostname: String::from("foo"),
                     port: None,
                 }),
-                path: build_path(vec!["", "bar", ""]),
+                path: Path::from_components(vec!["", "bar", ""]),
                 query: None,
                 fragment: None,
             }
@@ -1982,7 +1983,7 @@ mod test {
     }
 
     fn check_normalize(test: &str, expected: &str) {
-        let mut path = Path::from(test);
+        let mut path = Path::from_str(test);
         path.normalize();
         assert_eq!(
             path.to_string(),
