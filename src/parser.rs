@@ -500,8 +500,9 @@ impl<'a> UrlParser<'a> {
             return Ok(());
         }
 
-        if self.find_forwards(&CodepointRange::from_codepoint('\\').as_included_set()) <= count
-            && count < self.chars.len()
+        if count != 2
+            || self.find_forwards(&CodepointRange::from_codepoint('\\').as_included_set()) <= count
+                && count < self.chars.len()
         {
             self.result.is_valid = false;
         }
@@ -525,6 +526,8 @@ impl<'a> UrlParser<'a> {
         if at_pos == (end_pos - 1) {
             return Err(self.error("Expected a non-empty host"));
         } else if at_pos < end_pos {
+            self.result.is_valid = false;
+
             let mut auth: Authentication = Default::default();
 
             let pass_pos =
@@ -608,21 +611,13 @@ impl<'a> UrlParser<'a> {
         } else if self.chars[0] == '\\' {
             self.result.is_valid = false;
             self.move_start(1)?;
-        } else if self.chars[0] == '?' || self.chars[0] == '#' {
-            self.result.builder.host = Some(Default::default());
-            return Ok(());
         } else {
-            if self.starts_with_drive_letter() {
-                self.result.is_valid = false;
-            }
-
             return Ok(());
         }
 
         // file slash state
 
         if self.chars.is_empty() {
-            self.result.is_valid = false;
             return Ok(());
         }
 
@@ -635,11 +630,12 @@ impl<'a> UrlParser<'a> {
             return Ok(());
         }
 
+        // file host state
+
         if self.starts_with_drive_letter() {
+            self.result.is_valid = false;
             return Ok(());
         }
-
-        // file host state
 
         let mut host: Host = Default::default();
 
@@ -663,11 +659,14 @@ impl<'a> UrlParser<'a> {
 
         // path start state
 
+        // If there is a host then the path is always absolute.
+        let mut is_absolute = self.result.builder.host.is_some();
+
         let endings = CodepointSet::from_included_set("?#");
 
         if self.chars.is_empty() || endings.includes(self.chars[0]) {
             // If we have a host then we always have an absolute path.
-            if self.result.builder.host.is_some() {
+            if is_absolute {
                 self.result.builder.path = Path::from("/");
             }
             return Ok(());
@@ -675,8 +674,8 @@ impl<'a> UrlParser<'a> {
 
         let separators = CodepointSet::from_included_set("\\\\/");
 
-        let mut is_absolute = separators.includes(self.chars[0]);
-        if is_absolute {
+        if separators.includes(self.chars[0]) {
+            is_absolute = true;
             if self.chars[0] == '\\' {
                 self.result.is_valid = false;
             }
@@ -697,7 +696,20 @@ impl<'a> UrlParser<'a> {
                     && self.chars[0].is_alphabetic()
                     && (self.chars[1] == '|' || self.chars[1] == ':')
                 {
-                    self.chars[1] = ':';
+                    if let Some(ref mut h) = self.result.builder.host {
+                        if !h.hostname.is_empty() {
+                            self.result.is_valid = false;
+                            h.hostname = String::new();
+                        }
+                    } else {
+                        self.result.is_valid = false;
+                        self.result.builder.host = Some(Default::default());
+                    }
+
+                    if self.chars[1] == '|' {
+                        self.chars[1] = ':';
+                        self.result.is_valid = false;
+                    }
                     is_absolute = true;
                 }
 
@@ -1015,7 +1027,7 @@ mod test {
         );
 
         let result = UrlParser::parse("//foo:bar@host").unwrap();
-        assert!(result.is_valid);
+        assert!(!result.is_valid);
         assert_eq!(
             result.builder,
             UrlBuilder {
@@ -1035,7 +1047,7 @@ mod test {
         );
 
         let result = UrlParser::parse("//foo@host").unwrap();
-        assert!(result.is_valid);
+        assert!(!result.is_valid);
         assert_eq!(
             result.builder,
             UrlBuilder {
@@ -1055,7 +1067,7 @@ mod test {
         );
 
         let result = UrlParser::parse("//:bar@host").unwrap();
-        assert!(result.is_valid);
+        assert!(!result.is_valid);
         assert_eq!(
             result.builder,
             UrlBuilder {
@@ -1098,7 +1110,7 @@ mod test {
         );
 
         let result = UrlParser::parse("http:host").unwrap();
-        assert!(result.is_valid);
+        assert!(!result.is_valid);
         assert_eq!(
             result.builder,
             UrlBuilder {
@@ -1115,7 +1127,7 @@ mod test {
         );
 
         let result = UrlParser::parse("http:/host").unwrap();
-        assert!(result.is_valid);
+        assert!(!result.is_valid);
         assert_eq!(
             result.builder,
             UrlBuilder {
@@ -1183,7 +1195,7 @@ mod test {
         );
 
         let result = UrlParser::parse("file://c:/").unwrap();
-        assert!(result.is_valid);
+        assert!(!result.is_valid);
         assert_eq!(
             result.builder,
             UrlBuilder {
@@ -1203,7 +1215,7 @@ mod test {
     #[test]
     fn test_parser_path() {
         let result = UrlParser::parse("file://c:/").unwrap();
-        assert!(result.is_valid);
+        assert!(!result.is_valid);
         assert_eq!(
             result.builder,
             UrlBuilder {
@@ -1220,7 +1232,7 @@ mod test {
         );
 
         let result = UrlParser::parse("file:///c|/").unwrap();
-        assert!(result.is_valid);
+        assert!(!result.is_valid);
         assert_eq!(
             result.builder,
             UrlBuilder {
@@ -1438,5 +1450,117 @@ mod test {
                 fragment: Some(String::from("foobarhello")),
             }
         );
+    }
+
+    fn parse_valid<'a, O>(spec: &str, base: O, expected: &str)
+    where
+        O: Into<Option<&'a str>>,
+    {
+        let result = UrlParser::parse(spec).unwrap();
+        assert!(result.is_valid);
+
+        let builder = match base.into() {
+            Some(s) => {
+                let base_result = UrlParser::parse(s).unwrap();
+                base_result.builder.join(&result.builder).unwrap()
+            }
+            None => result.builder,
+        };
+
+        assert_eq!(builder.spec(), expected);
+    }
+
+    fn parse_invalid<'a, O>(spec: &str, base: O, expected: &str)
+    where
+        O: Into<Option<&'a str>>,
+    {
+        let result = UrlParser::parse(spec).unwrap();
+        println!("Spec: {:?}", result.builder);
+        assert!(!result.is_valid);
+
+        let builder = match base.into() {
+            Some(s) => {
+                let base_result = UrlParser::parse(s).unwrap();
+                println!("Base: {:?}", base_result.builder);
+                base_result.builder.join(&result.builder).unwrap()
+            }
+            None => result.builder,
+        };
+
+        assert_eq!(builder.spec(), expected);
+    }
+
+    fn parse_fails(spec: &str) {
+        // Here a parse failure essentially means "not an absolute URL".
+        let failed = match UrlParser::parse(spec) {
+            Ok(r) => !r.builder.is_absolute_url(),
+            Err(_) => true,
+        };
+
+        assert!(failed);
+    }
+
+    #[test]
+    fn test_parser_spec_examples() {
+        parse_valid(
+            "https://example.com/././foo",
+            None,
+            "https://example.com/foo",
+        );
+
+        // hello:world is classed as relative.
+        // parse_valid("hello:world", "https://example.com/", "hello:world");
+
+        parse_valid(
+            "example",
+            "https://example.com/demo",
+            "https://example.com/example",
+        );
+
+        // Test seems wrong?
+        parse_valid("..", "file:///C:/demo", "file:///");
+
+        // Needs percent decoding to work.
+        // parse_valid("file://loc%61lhost/", None, "file:///");
+
+        // Needs host parsing.
+        // parse_valid("https://EXAMPLE.com/../x", None, "https://example.com/x");
+
+        parse_invalid("https:example.org", None, "https://example.org/");
+        parse_invalid("https://////example.com///", None, "https://example.com///");
+
+        // example.org is meant to be a path in this case?
+        /*parse_invalid(
+            "https:example.org",
+            "https://example.com/",
+            "https://example.com/example.org",
+        );*/
+        parse_invalid(
+            "\\example\\..\\demo/.\\",
+            "https://example.com/",
+            "https://example.com/demo/",
+        );
+        parse_invalid("file:///C|/demo", None, "file:///C:/demo");
+        parse_invalid(
+            "https://user:password@example.org/",
+            None,
+            "https://user:password@example.org/",
+        );
+
+        // Needs codepoint validation.
+        /*parse_invalid(
+            "https://example.org/foo bar",
+            None,
+            "https://example.org/foo%20bar",
+        );*/
+
+        // Needs host parsing and codepoint validation.
+        // parse_fails("https://ex ample.org/");
+
+        parse_fails("example");
+        parse_fails("https://example.com:demo");
+
+        // Needs host parsing.
+        // parse_fails("http://[www.example.com]/");
     }
 }

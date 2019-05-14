@@ -640,6 +640,10 @@ impl UrlBuilder {
     /// # }
     /// ```
     pub fn join(&self, relative: &UrlBuilder) -> UrlResult<UrlBuilder> {
+        if relative.is_absolute_url() {
+            return Ok(relative.clone());
+        }
+
         let mut new_builder: UrlBuilder = Default::default();
 
         new_builder.scheme = if relative.scheme.is_some() {
