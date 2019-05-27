@@ -3,8 +3,8 @@
 
 use super::{Authentication, Host, Path, Scheme, UrlBuilder, UrlError, UrlResult};
 use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
-use std::str::Chars;
 
+use std::str::Chars;
 /// These are the allowable code points in most parts of a uri string.
 const URL_CODE_POINTS: &str =
     "0-9A-Za-z!$&'()*+,-\\./:;=?@_~\u{00A0}-\u{D7FF}\u{E000}-\u{10FFFD}--\
@@ -175,34 +175,73 @@ impl<'a> Iterator for CodepointRangeIterator<'a> {
     }
 }
 
+pub struct CodepointSetIterator<'a> {
+    set: CodepointSet,
+    base: Chars<'a>,
+    is_done: bool,
+}
+
+impl<'a> CodepointSetIterator<'a> {
+    fn new(set: CodepointSet, base: &str) -> CodepointSetIterator {
+        CodepointSetIterator {
+            set,
+            base: base.chars(),
+            is_done: false,
+        }
+    }
+}
+
+impl<'a> Iterator for CodepointSetIterator<'a> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        if self.is_done {
+            return None;
+        }
+
+        let mut buffer = String::new();
+
+        while let Some(c) = self.base.next() {
+            if self.set.includes(c) {
+                return Some(buffer);
+            } else {
+                buffer.push(c);
+            }
+        }
+
+        self.is_done = true;
+        Some(buffer)
+    }
+}
+
 #[derive(Default, Clone)]
-struct CodepointSet {
+pub(crate) struct CodepointSet {
     included: Vec<CodepointRange>,
     excluded: Vec<CodepointRange>,
 }
 
 impl CodepointSet {
-    fn from_included_set(set: &str) -> CodepointSet {
+    pub fn from_included_set(set: &str) -> CodepointSet {
         let mut pointset: CodepointSet = Default::default();
         pointset.include_set(set);
         pointset
     }
 
-    fn from_excluded_set(set: &str) -> CodepointSet {
+    pub fn from_excluded_set(set: &str) -> CodepointSet {
         let mut pointset: CodepointSet = Default::default();
         pointset.exclude_set(set);
         pointset
     }
 
-    fn include_set(&mut self, set: &str) {
+    pub fn include_set(&mut self, set: &str) {
         self.included.extend(CodepointRangeIterator::new(set));
     }
 
-    fn exclude_set(&mut self, set: &str) {
+    pub fn exclude_set(&mut self, set: &str) {
         self.excluded.extend(CodepointRangeIterator::new(set));
     }
 
-    fn includes(&self, c: char) -> bool {
+    pub fn includes(&self, c: char) -> bool {
         for range in &self.excluded {
             if range.includes(c) {
                 return false;
@@ -220,6 +259,10 @@ impl CodepointSet {
         }
 
         false
+    }
+
+    pub fn split(self, string: &str) -> CodepointSetIterator {
+        CodepointSetIterator::new(self, string)
     }
 }
 
@@ -266,16 +309,9 @@ impl Neg for CodepointSet {
     }
 }
 
-pub(crate) struct ParseResult {
-    pub builder: UrlBuilder,
-    pub is_valid: bool,
-}
-
 /// Responsible for parsing URLs.
 pub(crate) struct UrlParser<'a> {
     spec: &'a str,
-    result: ParseResult,
-
     chars: Vec<char>,
 }
 
@@ -343,71 +379,63 @@ impl<'a> UrlParser<'a> {
 
         self.chars.len()
     }
-
-    fn starts_with_drive_letter(&self) -> bool {
-        let win_drive_letter = CodepointSet::from_included_set("a-zA-Z");
-        let win_drive_separator = CodepointSet::from_included_set(":|");
-        let end_points = CodepointSet::from_included_set("\\\\/?#");
-
-        self.chars.len() >= 2
-            && win_drive_letter.includes(self.chars[0])
-            && win_drive_separator.includes(self.chars[1])
-            && self.chars.len() > 2
-            && end_points.includes(self.chars[2])
-    }
 }
 
 impl<'a> UrlParser<'a> {
-    pub(crate) fn parse(spec: &str) -> UrlResult<ParseResult> {
-        let result = ParseResult {
-            builder: Default::default(),
-            is_valid: true,
-        };
-
+    pub(crate) fn parse_spec(spec: &str) -> UrlResult<UrlBuilder> {
         if spec.is_empty() {
-            return Ok(result);
+            return Ok(Default::default());
         }
 
         let mut parser = UrlParser {
             spec,
-            result,
             chars: spec.chars().collect(),
         };
 
+        parser.parse()
+    }
+
+    fn parse(&mut self) -> UrlResult<UrlBuilder> {
         // First strip any invalid codepoints.
-        parser.strip_invalid()?;
-        if parser.chars.is_empty() {
-            return Ok(parser.result);
+        self.strip_invalid()?;
+        if self.chars.is_empty() {
+            return Ok(Default::default());
         }
 
-        parser.parse_scheme()?;
+        let mut builder: UrlBuilder = Default::default();
 
-        if parser.result.builder.scheme == Some(Scheme::File) {
-            parser.parse_file_host()?;
+        builder.scheme = self.parse_scheme()?;
+        if self.chars.is_empty() {
+            return Ok(builder);
+        }
+
+        if builder.scheme == Some(Scheme::File) {
+            builder.host = self.parse_file_host()?;
         } else {
-            parser.parse_host()?;
+            builder.host = self.parse_host()?;
         }
 
-        parser.parse_path()?;
-        if parser.chars.is_empty() {
-            return Ok(parser.result);
+        builder.path =
+            self.parse_path(builder.host.is_some(), builder.scheme == Some(Scheme::File))?;
+        if self.chars.is_empty() {
+            return Ok(builder);
         }
 
-        if parser.chars[0] == '?' {
-            parser.move_start(1)?;
-            parser.parse_query()?;
-            if parser.chars.is_empty() {
-                return Ok(parser.result);
+        if self.chars[0] == '?' {
+            self.move_start(1)?;
+            builder.query = Some(self.parse_query()?);
+            if self.chars.is_empty() {
+                return Ok(builder);
             }
         }
 
-        if parser.chars[0] == '#' {
-            parser.move_start(1)?;
-            parser.parse_fragment()?;
-            assert!(parser.chars.is_empty());
+        if self.chars[0] == '#' {
+            self.move_start(1)?;
+            builder.fragment = Some(self.parse_fragment()?);
         }
 
-        Ok(parser.result)
+        assert!(self.chars.is_empty());
+        Ok(builder)
     }
 
     fn strip_invalid(&mut self) -> UrlResult<()> {
@@ -415,20 +443,18 @@ impl<'a> UrlParser<'a> {
         // the entire spec.
 
         // These code points are not allowed at the beginning or end of a URL.
-        let c0_and_space = CodepointSet::from_excluded_set("\u{0000}-\u{001F} ");
+        let c0_and_space = CodepointSet::from_excluded_set("\u{0000}-\u{0020} ");
 
         // Find the first codepoint that is not invalid.
         let chars = self.find_forwards(&c0_and_space);
         if chars > 0 {
             self.move_start(chars)?;
-            self.result.is_valid = false;
         }
 
         // Find the last codepoint that is not invalid.
         let chars = self.find_backwards(&c0_and_space);
         if chars > 0 {
             self.move_end(chars)?;
-            self.result.is_valid = false;
         }
 
         // Strip the invalid whitespace codepoints.
@@ -439,15 +465,14 @@ impl<'a> UrlParser<'a> {
                 i += 1;
             } else {
                 self.chars.remove(i);
-                self.result.is_valid = false;
             }
         }
 
         Ok(())
     }
 
-    fn parse_scheme(&mut self) -> UrlResult<()> {
-        // At this point the chars is guaranteed to be non-empty and contains
+    fn parse_scheme(&mut self) -> UrlResult<Option<Scheme>> {
+        // At this point chars is guaranteed to be non-empty and contains
         // the entire spec.
 
         // scheme start state
@@ -455,7 +480,7 @@ impl<'a> UrlParser<'a> {
         if !self.chars[0].is_ascii_alphabetic() {
             // This is an invalid codepoint for the start of the scheme so
             // assume there is no scheme.
-            return Ok(());
+            return Ok(None);
         }
 
         // scheme state
@@ -464,117 +489,105 @@ impl<'a> UrlParser<'a> {
 
         // Find the first character that isn't a valid scheme codepoint.
         let pos = self.find_forwards(&-scheme_points);
-        if pos < self.chars.len() && self.chars[pos] == ':' {
-            self.result.builder.scheme = Scheme::from(&self.extract_start(pos)?);
+        if pos == self.chars.len() || self.chars[pos] != ':' {
+            Ok(None)
+        } else {
+            let scheme_str = self.extract_start(pos)?;
+            // Skip the `:`
             self.move_start(1)?;
+            Ok(Scheme::from(&scheme_str))
         }
-
-        Ok(())
     }
 
-    fn parse_hostname(&mut self, count: usize) -> UrlResult<String> {
-        Ok(self.extract_start(count)?)
+    fn parse_hostname(&mut self, length: usize) -> UrlResult<String> {
+        Ok(self.extract_start(length)?)
     }
 
-    fn parse_host(&mut self) -> UrlResult<()> {
-        // Here we are just after after the `:` of the scheme, chars may be empty.
+    fn parse_host(&mut self) -> UrlResult<Option<Host>> {
+        // Here we are just after after the `:` of the scheme, chars is not empty.
 
         let count = self.find_forwards(&CodepointSet::from_excluded_set("\\\\/"));
-
-        // special schemes are allowed fewer that two slashes.
-        if let Some(ref s) = self.result.builder.scheme {
-            if let Scheme::NotSpecial(_) = s {
-                if count < 2 {
-                    // Let's assume this is a path?
-                    return Ok(());
-                }
-            }
-        } else if count < 2 {
-            // With no scheme we might be dealing with an absolute or relative
-            // URL.
-            return Ok(());
+        if count < 2 {
+            // No host separator means no host.
+            return Ok(None);
         }
 
-        if count != 2
-            || (self.find_forwards(&CodepointRange::from_codepoint('\\').as_included_set())
-                <= count
-                && count < self.chars.len())
-        {
-            self.result.is_valid = false;
-        }
+        // We have some kind of host for sure now.
+        let mut host: Host = Default::default();
 
-        self.move_start(count)?;
+        // Strip all slashes?
+        self.move_start(2)?;
 
         // authority state
 
-        let mut end_pos = self.find_forwards(&CodepointSet::from_included_set("\\\\/?#"));
-        if end_pos == 0 {
-            if let Some(Scheme::Special(_)) = self.result.builder.scheme {
-                return Err(self.error("Special URLs require a non-empty hostname."));
-            }
-            return Ok(());
+        // The length of the auth/hostname/port portion.
+        let mut host_len = if count > 2 {
+            0
+        } else {
+            self.find_forwards(&CodepointSet::from_included_set("\\\\/?#"))
+        };
+
+        if host_len == 0 {
+            return Ok(Some(host));
         }
 
-        let mut host: Host = Default::default();
+        // The length of the authority portion.
+        let auth_len = self.find_forwards(&CodepointRange::from_codepoint('@').as_included_set());
 
-        let at_pos = self.find_forwards(&CodepointRange::from_codepoint('@').as_included_set());
-
-        if at_pos == (end_pos - 1) {
-            return Err(self.error("Expected a non-empty host"));
-        } else if at_pos < end_pos {
-            self.result.is_valid = false;
+        // There is only auth info if it occurs before the end of the host part.
+        if auth_len < host_len {
+            host_len -= auth_len + 1;
 
             let mut auth: Authentication = Default::default();
 
             let pass_pos =
                 self.find_forwards(&CodepointRange::from_codepoint(':').as_included_set());
+            assert!(pass_pos != auth_len);
 
-            let (user_count, pass_count) = if pass_pos < at_pos {
-                (pass_pos, at_pos - (pass_pos + 1))
-            } else {
-                (at_pos, 0)
-            };
-
-            auth.username = self.extract_start(user_count)?;
-            if pass_pos < at_pos {
+            if pass_pos < auth_len {
+                // Handle the case where there is a password given.
+                auth.username = self.extract_start(pass_pos)?;
+                // Skip over the `:`.
                 self.move_start(1)?;
+                auth.password = self.extract_start(auth_len - (pass_pos + 1))?;
+            } else {
+                // Otherwise the entire auth is the username.
+                auth.username = self.extract_start(auth_len)?;
             }
-            auth.password = self.extract_start(pass_count)?;
+
+            // Skip over the `@`.
             self.move_start(1)?;
 
             host.authentication = Some(auth);
-
-            end_pos -= at_pos + 1;
         }
 
-        assert!(end_pos <= self.chars.len());
+        assert!(host_len <= self.chars.len());
 
         // host state
 
         let mut in_ipv6 = false;
         let mut pos = 0;
         loop {
+            if pos == host_len {
+                host.hostname = self.parse_hostname(pos)?;
+                break;
+            }
+
             if self.chars[pos] == '[' {
                 in_ipv6 = true;
             } else if self.chars[pos] == ']' {
                 in_ipv6 = false;
             } else if self.chars[pos] == ':' && !in_ipv6 {
                 if pos == 0 {
-                    self.result.is_valid = false;
-                } else {
-                    host.hostname = self.parse_hostname(pos)?;
+                    return Err(self.error("Cannot include a port without a hostname."));
                 }
+
+                host.hostname = self.parse_hostname(pos)?;
                 self.move_start(1)?;
-                end_pos -= pos + 1;
 
                 // port state
 
-                let bad_pos = self.find_forwards(&CodepointSet::from_excluded_set("0-9"));
-                if bad_pos < end_pos {
-                    return Err(self.error("Port component can only contain ascii digits."));
-                }
-
-                let port_str = self.extract_start(end_pos)?;
+                let port_str = self.extract_start(host_len - (pos + 1))?;
                 match u32::from_str_radix(&port_str, 10) {
                     Ok(p) => host.port = Some(p),
                     Err(_) => return Err(self.error("Unable to parse port number.")),
@@ -583,209 +596,85 @@ impl<'a> UrlParser<'a> {
                 break;
             }
             pos += 1;
-
-            if pos == end_pos {
-                host.hostname = self.parse_hostname(pos)?;
-                break;
-            }
         }
 
-        self.result.builder.host = Some(host);
-
-        Ok(())
+        Ok(Some(host))
     }
 
-    fn parse_file_host(&mut self) -> UrlResult<()> {
-        // Here we are just after the `:` of the scheme, chars may be empty.
+    fn parse_file_host(&mut self) -> UrlResult<Option<Host>> {
+        // Here we are just after the `:` of the scheme, chars is not empty.
 
         // file state
 
-        // file scheme URLs always have an empty hostname if not otherwise
-        // defined.
-        self.result.builder.host = Some(Default::default());
-
-        if self.chars.is_empty() {
-            self.result.is_valid = false;
-            return Ok(());
-        }
-
-        if self.chars[0] == '/' {
-            self.move_start(1)?;
-        } else if self.chars[0] == '\\' {
-            self.result.is_valid = false;
-            self.move_start(1)?;
-        } else {
-            self.result.is_valid = false;
-            return Ok(());
-        }
-
-        // file slash state
-
-        if self.chars.is_empty() {
-            self.result.is_valid = false;
-            return Ok(());
-        }
-
-        if self.chars[0] == '/' {
-            self.move_start(1)?;
-        } else if self.chars[0] == '\\' {
-            self.result.is_valid = false;
-            self.move_start(1)?;
-        } else {
-            self.result.is_valid = false;
-            return Ok(());
-        }
-
-        // file host state
-
-        if self.starts_with_drive_letter() {
-            self.result.is_valid = false;
-            return Ok(());
-        }
-
-        let mut host: Host = Default::default();
-
-        let end_points = CodepointSet::from_included_set("\\\\/?#");
-        let count = self.find_forwards(&end_points);
-
-        if count > 0 {
-            host.hostname = self.parse_hostname(count)?;
-            if host.hostname == "localhost" {
-                host.hostname = String::new();
+        Ok(self.parse_host()?.map(|mut h| {
+            if h.hostname == "localhost" {
+                h.hostname = String::new();
             }
-        }
-
-        self.result.builder.host = Some(host);
-
-        Ok(())
+            h
+        }))
     }
 
-    fn parse_path(&mut self) -> UrlResult<()> {
+    fn parse_path(&mut self, has_host: bool, is_file_path: bool) -> UrlResult<Path> {
         // Here we are at the start of the path, chars may be empty.
 
         // path start state
 
         // If there is a host then the path is always absolute.
-        let mut is_absolute = self.result.builder.host.is_some();
-
         let endings = CodepointSet::from_included_set("?#");
+        let length = if self.chars.is_empty() {
+            0
+        } else {
+            self.find_forwards(&endings)
+        };
 
-        if self.chars.is_empty() || endings.includes(self.chars[0]) {
+        if length == 0 {
             // If we have a host then we always have an absolute path.
-            if is_absolute {
-                self.result.builder.path.components = vec![String::new(), String::new()];
+            if has_host {
+                return Ok(Path::root_path());
             }
-            return Ok(());
+            return Ok(Default::default());
         }
 
-        let separators = CodepointSet::from_included_set("\\\\/");
+        let mut path: Path = self.extract_start(length)?.parse()?;
 
-        if separators.includes(self.chars[0]) {
-            is_absolute = true;
-            if self.chars[0] == '\\' {
-                self.result.is_valid = false;
-            }
-            self.move_start(1)?;
-        }
-
-        let mut pos = 0;
-        loop {
-            if pos == self.chars.len()
-                || endings.includes(self.chars[pos])
-                || separators.includes(self.chars[pos])
-            {
-                // Parse out path part.
-
-                if pos == 2
-                    && self.result.builder.path.components.is_empty()
-                    && self.result.builder.scheme == Some(Scheme::File)
-                    && self.chars[0].is_alphabetic()
-                    && (self.chars[1] == '|' || self.chars[1] == ':')
-                {
-                    if let Some(ref mut h) = self.result.builder.host {
-                        if !h.hostname.is_empty() {
-                            self.result.is_valid = false;
-                            h.hostname = String::new();
+        if is_file_path && path.components.len() > 1 && path.is_absolute() {
+            if let Some(component) = path.components.get(1) {
+                if component.len() == 2 && component.ends_with('|') {
+                    if let Some(drive) = component.chars().next() {
+                        if drive.is_ascii_alphabetic() {
+                            path.components.remove(1);
+                            path.components.insert(1, drive.to_string() + ":");
                         }
-                    } else {
-                        self.result.is_valid = false;
-                        self.result.builder.host = Some(Default::default());
                     }
-
-                    if self.chars[1] == '|' {
-                        self.chars[1] = ':';
-                        self.result.is_valid = false;
-                    }
-                    is_absolute = true;
                 }
-
-                let part = self.extract_start(pos)?;
-                pos = 0;
-                self.result.builder.path.components.push(part);
-
-                if self.chars.is_empty() || endings.includes(self.chars[pos]) {
-                    break;
-                }
-
-                if self.chars[pos] == '\\' {
-                    self.result.is_valid = false;
-                }
-
-                self.move_start(1)?;
-                pos = 0;
-            } else if self.chars[pos] == '%'
-                && (self.chars.len() - pos < 3
-                    || !self.chars[1].is_ascii_hexdigit()
-                    || !self.chars[2].is_ascii_hexdigit())
-            {
-                self.result.is_valid = false;
-                self.chars.insert(pos + 1, '2');
-                self.chars.insert(pos + 2, '5');
-                pos += 3;
-            } else {
-                // TODO Check if invalid.
-                pos += 1;
             }
         }
 
-        if is_absolute {
-            self.result.builder.path.components.insert(0, String::new());
-        }
-
-        self.result.builder.normalize();
-
-        Ok(())
+        Ok(path)
     }
 
-    fn parse_query(&mut self) -> UrlResult<()> {
+    fn parse_query(&mut self) -> UrlResult<String> {
         // At this point chars may be empty and will not contain the `?` prefix.
 
         // query state
 
         let count = self.find_forwards(&CodepointRange::from_codepoint('#').as_included_set());
-        // TODO check for invalid codepoints.
 
-        self.result.builder.query = Some(self.extract_start(count)?);
-
-        Ok(())
+        Ok(self.extract_start(count)?)
     }
 
-    fn parse_fragment(&mut self) -> UrlResult<()> {
+    fn parse_fragment(&mut self) -> UrlResult<String> {
         // At this point chars may be empty and will not contain the `#` prefix.
 
         // fragment state
 
-        // TODO check for invalid codepoints.
-
-        self.result.builder.fragment = Some(self.extract_start(self.chars.len())?);
-
-        Ok(())
+        Ok(self.extract_start(self.chars.len())?)
     }
 }
 
 #[cfg(test)]
 mod test {
-    #![allow(clippy::cyclomatic_complexity)]
+    #![allow(clippy::cognitive_complexity)]
     use super::*;
 
     fn verify_codepoint_range(range: &CodepointRange, includes: Vec<char>, excludes: Vec<char>) {
@@ -852,17 +741,45 @@ mod test {
 
         let set = CodepointSet::from_included_set("4-5\\-7");
         verify_codepoint_set(&set, vec!['4', '5', '-', '7'], vec!['3', '6', '8', '\\']);
+
+        let set = CodepointSet::from_included_set("4-5\\\\97");
+        verify_codepoint_set(&set, vec!['4', '5', '\\', '7', '9'], vec!['3', '6', '8']);
+    }
+
+    fn check_split(set: CodepointSet, string: &str, expected: Vec<&str>) {
+        assert_eq!(
+            set.split(string).collect::<Vec<String>>(),
+            expected
+                .iter()
+                .cloned()
+                .map(|s| s.to_owned())
+                .collect::<Vec<String>>()
+        );
+    }
+
+    #[test]
+    fn test_split_codepointset() {
+        check_split(
+            CodepointSet::from_included_set("s"),
+            "foosbar",
+            vec!["foo", "bar"],
+        );
+
+        check_split(
+            CodepointSet::from_included_set("g-h"),
+            "foogbarhzed",
+            vec!["foo", "bar", "zed"],
+        );
     }
 
     /// Test that invalid codepoints are stripped.
     #[test]
-    fn test_parser_invalid() {
-        let result = UrlParser::parse("  https://www.google.com/ ").unwrap();
-        assert!(!result.is_valid);
+    fn test_parser_invalid() -> UrlResult<()> {
+        let builder = UrlParser::parse_spec("  https://www.google.com/ ")?;
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::Special(String::from("https"))),
+                scheme: Some(Scheme::Named(String::from("https"))),
                 host: Some(Host {
                     authentication: None,
                     hostname: String::from("www.google.com"),
@@ -874,12 +791,11 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("\tht\ntps://w\tww.g\n\toogle.com/\n\n").unwrap();
-        assert!(!result.is_valid);
+        let builder = UrlParser::parse_spec("\tht\ntps://w\tww.g\n\toogle.com/\n\n")?;
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::Special(String::from("https"))),
+                scheme: Some(Scheme::Named(String::from("https"))),
                 host: Some(Host {
                     authentication: None,
                     hostname: String::from("www.google.com"),
@@ -890,16 +806,17 @@ mod test {
                 fragment: None,
             }
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_parser_scheme() {
-        let result = UrlParser::parse("goodscheme:").unwrap();
-        assert!(result.is_valid);
+    fn test_parser_scheme() -> UrlResult<()> {
+        let builder = UrlParser::parse_spec("goodscheme:")?;
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::NotSpecial(String::from("goodscheme"))),
+                scheme: Some(Scheme::Named(String::from("goodscheme"))),
                 host: None,
                 path: Default::default(),
                 query: None,
@@ -907,12 +824,11 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("UppErscheme:").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("UppErscheme:")?;
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::NotSpecial(String::from("upperscheme"))),
+                scheme: Some(Scheme::Named(String::from("upperscheme"))),
                 host: None,
                 path: Default::default(),
                 query: None,
@@ -920,10 +836,9 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("noscheme").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("noscheme")?;
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: None,
@@ -933,10 +848,9 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("1badscheme:").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("1badscheme:")?;
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: None,
@@ -946,10 +860,9 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("bad>scheme:").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("bad>scheme:")?;
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: None,
@@ -958,16 +871,19 @@ mod test {
                 fragment: None,
             }
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_parser_host() {
-        let result = UrlParser::parse("scheme://host").unwrap();
-        assert!(result.is_valid);
+    fn test_parser_host() -> UrlResult<()> {
+        let builder = UrlParser::parse_spec("scheme://host")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::NotSpecial(String::from("scheme"))),
+                scheme: Some(Scheme::Named(String::from("scheme"))),
                 host: Some(Host {
                     authentication: None,
                     hostname: String::from("host"),
@@ -979,25 +895,27 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("scheme://").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("scheme://")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::NotSpecial(String::from("scheme"))),
-                host: None,
-                path: Default::default(),
+                scheme: Some(Scheme::Named(String::from("scheme"))),
+                host: Some(Default::default()),
+                path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
         );
 
-        let result = UrlParser::parse("scheme:/").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("scheme:/")?;
+        assert!(!builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::NotSpecial(String::from("scheme"))),
+                scheme: Some(Scheme::Named(String::from("scheme"))),
                 host: None,
                 path: Path::root_path(),
                 query: None,
@@ -1005,12 +923,13 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("scheme:/foo").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("scheme:/foo")?;
+        assert!(!builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::NotSpecial(String::from("scheme"))),
+                scheme: Some(Scheme::Named(String::from("scheme"))),
                 host: None,
                 path: Path::from_components(vec!["", "foo"]),
                 query: None,
@@ -1018,12 +937,13 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("scheme:foo").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("scheme:foo")?;
+        assert!(!builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::NotSpecial(String::from("scheme"))),
+                scheme: Some(Scheme::Named(String::from("scheme"))),
                 host: None,
                 path: Path::from_components(vec!["foo"]),
                 query: None,
@@ -1031,49 +951,71 @@ mod test {
             }
         );
 
-        assert!(UrlParser::parse("http:///").is_err());
-        assert!(UrlParser::parse("http://").is_err());
-        assert!(UrlParser::parse("http:/").is_err());
-        assert!(UrlParser::parse("http:").is_err());
-
-        let result = UrlParser::parse("scheme:////host").unwrap();
-        assert!(!result.is_valid);
+        let builder = UrlParser::parse_spec("http:///")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::NotSpecial(String::from("scheme"))),
-                host: Some(Host {
-                    authentication: None,
-                    hostname: String::from("host"),
-                    port: None
-                }),
+                scheme: Some(Scheme::Named(String::from("http"))),
+                host: Some(Default::default()),
                 path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
         );
 
-        let result = UrlParser::parse("scheme:\\\\host").unwrap();
-        assert!(!result.is_valid);
+        let builder = UrlParser::parse_spec("http://")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::NotSpecial(String::from("scheme"))),
-                host: Some(Host {
-                    authentication: None,
-                    hostname: String::from("host"),
-                    port: None
-                }),
+                scheme: Some(Scheme::Named(String::from("http"))),
+                host: Some(Default::default()),
                 path: Path::root_path(),
                 query: None,
                 fragment: None,
             }
         );
 
-        let result = UrlParser::parse("//host").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("scheme:////host")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
+            UrlBuilder {
+                scheme: Some(Scheme::Named(String::from("scheme"))),
+                host: Some(Default::default()),
+                path: Path::from_components(vec!["", "", "host"]),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let builder = UrlParser::parse_spec("scheme:\\\\host")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
+        assert_eq!(
+            builder,
+            UrlBuilder {
+                scheme: Some(Scheme::Named(String::from("scheme"))),
+                host: Some(Host {
+                    authentication: None,
+                    hostname: String::from("host"),
+                    port: None,
+                }),
+                path: Path::from_components(vec!["", ""]),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let builder = UrlParser::parse_spec("//host")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
+        assert_eq!(
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: Some(Host {
@@ -1087,10 +1029,11 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("//foo:bar@host").unwrap();
-        assert!(!result.is_valid);
+        let builder = UrlParser::parse_spec("//foo:bar@host")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: Some(Host {
@@ -1107,10 +1050,11 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("//foo@host").unwrap();
-        assert!(!result.is_valid);
+        let builder = UrlParser::parse_spec("//foo@host")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: Some(Host {
@@ -1127,10 +1071,11 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("//:bar@host").unwrap();
-        assert!(!result.is_valid);
+        let builder = UrlParser::parse_spec("//:bar@host")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: Some(Host {
@@ -1147,16 +1092,35 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("//:bar@");
-        assert!(result.is_err());
-
-        let result = UrlParser::parse("//host:ng");
-        assert!(result.is_err());
-
-        let result = UrlParser::parse("//host:59").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("//:bar@")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
+            UrlBuilder {
+                scheme: None,
+                host: Some(Host {
+                    authentication: Some(Authentication {
+                        username: String::new(),
+                        password: String::from("bar"),
+                    }),
+                    hostname: String::new(),
+                    port: None
+                }),
+                path: Path::root_path(),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let result = UrlParser::parse_spec("//host:ng");
+        assert!(result.is_err());
+
+        let builder = UrlParser::parse_spec("//host:59")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
+        assert_eq!(
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: Some(Host {
@@ -1170,44 +1134,39 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("http:host").unwrap();
-        assert!(!result.is_valid);
+        let builder = UrlParser::parse_spec("http:host")?;
+        assert!(!builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::Special(String::from("http"))),
-                host: Some(Host {
-                    authentication: None,
-                    hostname: String::from("host"),
-                    port: None
-                }),
-                path: Path::root_path(),
+                scheme: Some(Scheme::Named(String::from("http"))),
+                host: None,
+                path: Path::from_components(vec!["host"]),
                 query: None,
                 fragment: None,
             }
         );
 
-        let result = UrlParser::parse("http:/host").unwrap();
-        assert!(!result.is_valid);
+        let builder = UrlParser::parse_spec("http:/host")?;
+        assert!(!builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::Special(String::from("http"))),
-                host: Some(Host {
-                    authentication: None,
-                    hostname: String::from("host"),
-                    port: None
-                }),
-                path: Path::root_path(),
+                scheme: Some(Scheme::Named(String::from("http"))),
+                host: None,
+                path: Path::from_components(vec!["", "host"]),
                 query: None,
                 fragment: None,
             }
         );
 
-        let result = UrlParser::parse("file:////").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("file:////")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: Some(Scheme::File),
                 host: Some(Host {
@@ -1221,10 +1180,11 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("file:///").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("file:///")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: Some(Scheme::File),
                 host: Some(Host {
@@ -1238,10 +1198,11 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("file://").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("file://")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: Some(Scheme::File),
                 host: Some(Host {
@@ -1255,10 +1216,25 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("file:/").unwrap();
-        assert!(!result.is_valid);
+        let builder = UrlParser::parse_spec("file:/")?;
+        assert!(!builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
+            UrlBuilder {
+                scheme: Some(Scheme::File),
+                host: None,
+                path: Path::root_path(),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let builder = UrlParser::parse_spec("file://localhost/")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
+        assert_eq!(
+            builder,
             UrlBuilder {
                 scheme: Some(Scheme::File),
                 host: Some(Host {
@@ -1272,47 +1248,19 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("file://localhost/").unwrap();
-        assert!(result.is_valid);
-        assert_eq!(
-            result.builder,
-            UrlBuilder {
-                scheme: Some(Scheme::File),
-                host: Some(Host {
-                    authentication: None,
-                    hostname: String::new(),
-                    port: None,
-                }),
-                path: Path::root_path(),
-                query: None,
-                fragment: None,
-            }
-        );
+        let result = UrlParser::parse_spec("file://c:/");
+        assert!(result.is_err());
 
-        let result = UrlParser::parse("file://c:/").unwrap();
-        assert!(!result.is_valid);
-        assert_eq!(
-            result.builder,
-            UrlBuilder {
-                scheme: Some(Scheme::File),
-                host: Some(Host {
-                    authentication: None,
-                    hostname: String::new(),
-                    port: None,
-                }),
-                path: Path::from_components(vec!["", "c:", ""]),
-                query: None,
-                fragment: None,
-            }
-        );
+        Ok(())
     }
 
     #[test]
-    fn test_parser_path() {
-        let result = UrlParser::parse("file://c:/").unwrap();
-        assert!(!result.is_valid);
+    fn test_parser_path() -> UrlResult<()> {
+        let builder = UrlParser::parse_spec("file:///c:/")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: Some(Scheme::File),
                 host: Some(Host {
@@ -1326,10 +1274,11 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("file:///c|/").unwrap();
-        assert!(!result.is_valid);
+        let builder = UrlParser::parse_spec("file:///c|/")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: Some(Scheme::File),
                 host: Some(Host {
@@ -1343,10 +1292,11 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("file:///foo/c|/").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("file:///foo/c|/")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: Some(Scheme::File),
                 host: Some(Host {
@@ -1360,12 +1310,13 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("http://host/foo/bar").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("http://host/foo/bar")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::Special(String::from("http"))),
+                scheme: Some(Scheme::Named(String::from("http"))),
                 host: Some(Host {
                     authentication: None,
                     hostname: String::from("host"),
@@ -1377,12 +1328,13 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("http://host/foo/bar/").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("http://host/foo/bar/")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::Special(String::from("http"))),
+                scheme: Some(Scheme::Named(String::from("http"))),
                 host: Some(Host {
                     authentication: None,
                     hostname: String::from("host"),
@@ -1394,44 +1346,47 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("http://host/foo/../bar/./..").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("http://host/foo/../bar/./..")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::Special(String::from("http"))),
+                scheme: Some(Scheme::Named(String::from("http"))),
                 host: Some(Host {
                     authentication: None,
                     hostname: String::from("host"),
                     port: None,
                 }),
-                path: Path::root_path(),
+                path: Path::from_components(vec!["", "foo", "..", "bar", ".", ".."]),
                 query: None,
                 fragment: None,
             }
         );
 
-        let result = UrlParser::parse("http://host/./foo/../bar/").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("http://host/./foo/../bar/")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::Special(String::from("http"))),
+                scheme: Some(Scheme::Named(String::from("http"))),
                 host: Some(Host {
                     authentication: None,
                     hostname: String::from("host"),
                     port: None,
                 }),
-                path: Path::from_components(vec!["", "bar", ""]),
+                path: Path::from_components(vec!["", ".", "foo", "..", "bar", ""]),
                 query: None,
                 fragment: None,
             }
         );
 
-        let result = UrlParser::parse("/foo/bar").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("/foo/bar")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: None,
@@ -1441,10 +1396,11 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("/foo/bar/").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("/foo/bar/")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: None,
@@ -1454,26 +1410,114 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("/foo/../bar/").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("/foo/../bar/")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: None,
-                path: Path::from_components(vec!["", "bar", ""]),
+                path: Path::from_components(vec!["", "foo", "..", "bar", ""]),
                 query: None,
                 fragment: None,
             }
         );
+
+        let builder = UrlParser::parse_spec("http://user:pass@host/foo/bar/")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
+        assert_eq!(
+            builder,
+            UrlBuilder {
+                scheme: Some(Scheme::Named(String::from("http"))),
+                host: Some(Host {
+                    authentication: Some(Authentication {
+                        username: String::from("user"),
+                        password: String::from("pass"),
+                    }),
+                    hostname: String::from("host"),
+                    port: None,
+                }),
+                path: Path::from_components(vec!["", "foo", "bar", ""]),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let builder = UrlParser::parse_spec("http://user:@host/foo/bar/")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
+        assert_eq!(
+            builder,
+            UrlBuilder {
+                scheme: Some(Scheme::Named(String::from("http"))),
+                host: Some(Host {
+                    authentication: Some(Authentication {
+                        username: String::from("user"),
+                        password: String::new(),
+                    }),
+                    hostname: String::from("host"),
+                    port: None,
+                }),
+                path: Path::from_components(vec!["", "foo", "bar", ""]),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let builder = UrlParser::parse_spec("http://user@host/foo/bar/")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
+        assert_eq!(
+            builder,
+            UrlBuilder {
+                scheme: Some(Scheme::Named(String::from("http"))),
+                host: Some(Host {
+                    authentication: Some(Authentication {
+                        username: String::from("user"),
+                        password: String::new(),
+                    }),
+                    hostname: String::from("host"),
+                    port: None,
+                }),
+                path: Path::from_components(vec!["", "foo", "bar", ""]),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        let builder = UrlParser::parse_spec("http://:pass@host/foo/bar/")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
+        assert_eq!(
+            builder,
+            UrlBuilder {
+                scheme: Some(Scheme::Named(String::from("http"))),
+                host: Some(Host {
+                    authentication: Some(Authentication {
+                        username: String::new(),
+                        password: String::from("pass"),
+                    }),
+                    hostname: String::from("host"),
+                    port: None,
+                }),
+                path: Path::from_components(vec!["", "foo", "bar", ""]),
+                query: None,
+                fragment: None,
+            }
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn test_parser_query() {
-        let result = UrlParser::parse("?foobarhello").unwrap();
-        assert!(result.is_valid);
+    fn test_parser_query() -> UrlResult<()> {
+        let builder = UrlParser::parse_spec("?foobarhello")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: None,
@@ -1483,12 +1527,13 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("http://www?foobarhello").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("http://www?foobarhello")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::Special(String::from("http"))),
+                scheme: Some(Scheme::Named(String::from("http"))),
                 host: Some(Host {
                     authentication: None,
                     hostname: String::from("www"),
@@ -1499,14 +1544,17 @@ mod test {
                 fragment: None,
             }
         );
+
+        Ok(())
     }
 
     #[test]
-    fn test_parser_fragment() {
-        let result = UrlParser::parse("#foobarhello").unwrap();
-        assert!(result.is_valid);
+    fn test_parser_fragment() -> UrlResult<()> {
+        let builder = UrlParser::parse_spec("#foobarhello")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: None,
@@ -1516,12 +1564,13 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("http://www#foobarhello").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("http://www#foobarhello")?;
+        assert!(builder.is_absolute_url());
+        assert!(!builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
-                scheme: Some(Scheme::Special(String::from("http"))),
+                scheme: Some(Scheme::Named(String::from("http"))),
                 host: Some(Host {
                     authentication: None,
                     hostname: String::from("www"),
@@ -1533,10 +1582,11 @@ mod test {
             }
         );
 
-        let result = UrlParser::parse("?#foobarhello").unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec("?#foobarhello")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
         assert_eq!(
-            result.builder,
+            builder,
             UrlBuilder {
                 scheme: None,
                 host: None,
@@ -1545,50 +1595,59 @@ mod test {
                 fragment: Some(String::from("foobarhello")),
             }
         );
+
+        let builder = UrlParser::parse_spec("hello?#foobarhello")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
+        assert_eq!(
+            builder,
+            UrlBuilder {
+                scheme: None,
+                host: None,
+                path: Path::from_components(vec!["hello"]),
+                query: Some(String::new()),
+                fragment: Some(String::from("foobarhello")),
+            }
+        );
+
+        let builder = UrlParser::parse_spec("hello#foobarhello?")?;
+        assert!(!builder.is_absolute_url());
+        assert!(builder.is_relative_url());
+        assert_eq!(
+            builder,
+            UrlBuilder {
+                scheme: None,
+                host: None,
+                path: Path::from_components(vec!["hello"]),
+                query: None,
+                fragment: Some(String::from("foobarhello?")),
+            }
+        );
+
+        Ok(())
     }
 
-    fn parse_valid<'a, O>(spec: &str, base: O, expected: &str)
+    fn parse_succeeds<'a, O>(spec: &str, base: O, expected: &str) -> UrlResult<()>
     where
         O: Into<Option<&'a str>>,
     {
-        let result = UrlParser::parse(spec).unwrap();
-        assert!(result.is_valid);
+        let builder = UrlParser::parse_spec(spec)?;
 
-        let builder = match base.into() {
-            Some(s) => {
-                let base_result = UrlParser::parse(s).unwrap();
-                base_result.builder.join(&result.builder).unwrap()
-            }
-            None => result.builder,
+        let mut builder = match base.into() {
+            Some(s) => UrlParser::parse_spec(s)?.join(&builder)?,
+            None => builder,
         };
 
+        builder.normalize();
         assert_eq!(builder.spec(), expected);
-    }
 
-    fn parse_invalid<'a, O>(spec: &str, base: O, expected: &str)
-    where
-        O: Into<Option<&'a str>>,
-    {
-        let result = UrlParser::parse(spec).unwrap();
-        println!("Spec: {:?}", result.builder);
-        assert!(!result.is_valid);
-
-        let builder = match base.into() {
-            Some(s) => {
-                let base_result = UrlParser::parse(s).unwrap();
-                println!("Base: {:?}", base_result.builder);
-                base_result.builder.join(&result.builder).unwrap()
-            }
-            None => result.builder,
-        };
-
-        assert_eq!(builder.spec(), expected);
+        Ok(())
     }
 
     fn parse_fails(spec: &str) {
         // Here a parse failure essentially means "not an absolute URL".
-        let failed = match UrlParser::parse(spec) {
-            Ok(r) => !r.builder.is_absolute_url(),
+        let failed = match UrlParser::parse_spec(spec) {
+            Ok(builder) => !builder.is_absolute_url(),
             Err(_) => true,
         };
 
@@ -1596,67 +1655,66 @@ mod test {
     }
 
     #[test]
-    fn test_parser_spec_examples() {
-        parse_valid(
+    fn test_parser_spec_examples() -> UrlResult<()> {
+        parse_succeeds(
             "https://example.com/././foo",
             None,
             "https://example.com/foo",
-        );
+        )?;
 
-        // hello:world is classed as relative.
-        // parse_valid("hello:world", "https://example.com/", "hello:world");
-
-        parse_valid(
+        parse_succeeds(
             "example",
             "https://example.com/demo",
             "https://example.com/example",
-        );
+        )?;
 
         // Test seems wrong? Expected is meant to be `file:///C:/`. Firefox
         // disagrees.
-        parse_valid("..", "file:///C:/demo", "file:///");
+        parse_succeeds("..", "file:///C:/demo", "file:///")?;
 
         // Needs percent decoding to work.
-        // parse_valid("file://loc%61lhost/", None, "file:///");
+        // parse_succeeds("file://loc%61lhost/", None, "file:///");
 
         // Needs host parsing.
-        // parse_valid("https://EXAMPLE.com/../x", None, "https://example.com/x");
+        // parse_succeeds("https://EXAMPLE.com/../x", None, "https://example.com/x");
 
-        parse_invalid("https:example.org", None, "https://example.org/");
-        parse_invalid("https://////example.com///", None, "https://example.com///");
+        parse_succeeds(
+            "https://////example.com///",
+            None,
+            "https://////example.com///",
+        )?;
 
-        // example.org is meant to be a path in this case?
-        /*parse_invalid(
-            "https:example.org",
-            "https://example.com/",
-            "https://example.com/example.org",
-        );*/
-        parse_invalid(
+        parse_succeeds(
             "\\example\\..\\demo/.\\",
             "https://example.com/",
             "https://example.com/demo/",
-        );
-        parse_invalid("file:///C|/demo", None, "file:///C:/demo");
-        parse_invalid(
+        )?;
+        parse_succeeds("file:///C|/demo", None, "file:///C:/demo")?;
+        parse_succeeds(
             "https://user:password@example.org/",
             None,
             "https://user:password@example.org/",
-        );
+        )?;
 
-        // Needs codepoint validation.
-        /*parse_invalid(
+        // Needs percent encoding.
+        /*parse_succeeds(
             "https://example.org/foo bar",
             None,
             "https://example.org/foo%20bar",
         );*/
 
-        // Needs host parsing and codepoint validation.
+        // Needs percent encoding.
         // parse_fails("https://ex ample.org/");
 
         parse_fails("example");
+        parse_fails("https:example.org");
         parse_fails("https://example.com:demo");
+        parse_fails("hello:world");
+        parse_fails("https:example.org");
 
         // Needs host parsing.
         // parse_fails("http://[www.example.com]/");
+
+        Ok(())
     }
 }
